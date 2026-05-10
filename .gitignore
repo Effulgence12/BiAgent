@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+.env
+.env.*
+!.env.example
+.DS_Store
+
+# Data and generated artifacts
+data/raw/*.csv
+data/processed/
+reports/screenshots/
+models/cache/
+*.sqlite
+*.db
