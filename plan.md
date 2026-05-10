@@ -21,13 +21,13 @@
 |------|------|------|
 | LLM | DeepSeek API（`deepseek-chat`） | 免费额度充足、中文友好、Function Calling 完善 |
 | Agent 框架 | LangGraph | 任务书明确推荐；支持有状态 StateGraph + MemorySaver |
-| 数据库 | SQLite（替代 MySQL） | 无需安装服务、文件即数据库；查询 API 与 MySQL 完全兼容；数据集单机够用 |
+| 数据库 | MySQL | 任务书明确要求；适合多表 JOIN、预聚合表、索引优化和性能对比演示 |
 | 预测模型 | Prophet（主）| 时序预测首选，自带置信区间；无需 GPU |
 | 可视化 | Plotly（图表）+ Folium（地图） | Plotly 输出 HTML 可直接嵌 Web；Folium 渲染巴西州热力图 |
 | Web 后端 | FastAPI + WebSocket | 轻量；支持流式返回 Agent 中间过程 |
 | Web 前端 | 原生 HTML/CSS/JS | 无需构建工具；双栏布局简单实现 |
 
-> **SQLite 替代 MySQL 说明**：任务书允许使用"查询引擎"而非强制 MySQL。SQLite 在单机 4GB 数据集上性能完全满足，预聚合视图可用 `CREATE TABLE AS SELECT` 实现，Agent 的 SQL 完全可移植。
+> **MySQL 使用说明**：原始表与预聚合表统一驻留在 MySQL 中。系统通过 `utils/db_init.py` 完成建库、导入、索引创建与预聚合表刷新；DataAnalyst Agent 生成的 SQL 优先查询 `mv_*` 预聚合表，无法覆盖时再回退到基础表 JOIN。
 
 ---
 
@@ -36,8 +36,7 @@
 ```
 AgenticBI_Final_Olist/
 ├── data/
-│   ├── raw/                    # Olist 原始 9 张 CSV
-│   └── olist.db                # SQLite 数据库（含预聚合视图）
+│   └── raw/                    # Olist 原始 9 张 CSV
 ├── agents/
 │   ├── orchestrator.py         # 协调器 Agent
 │   ├── data_analyst.py         # 数据分析 Agent（NL→SQL）
@@ -47,6 +46,9 @@ AgenticBI_Final_Olist/
 │   ├── db_init.py              # 数据清洗 + 建库 + 预聚合视图创建
 │   ├── schema.py               # 数据字典（表结构 + 视图说明，注入 Prompt）
 │   └── query_router.py         # 视图命中判断 / 回退逻辑
+├── sql/
+│   ├── schema.sql              # MySQL 基础表结构、索引
+│   └── materialized_views.sql  # 预聚合表创建与刷新 SQL
 ├── models/
 │   └── forecast.py             # Prophet 时序预测封装
 ├── config/
@@ -115,7 +117,7 @@ Prompt 格式：
 
 ## 五、预聚合视图设计
 
-在 `utils/db_init.py` 中，系统启动时自动创建以下 6 张预计算表：
+在 MySQL 中维护以下 6 张预聚合表，并通过 `utils/db_init.py` 或 `sql/materialized_views.sql` 一键刷新：
 
 | 视图名 | 粒度 | 主要用途 |
 |--------|------|---------|
@@ -126,13 +128,13 @@ Prompt 格式：
 | `mv_seller_perf` | 年-月-卖家 | 卖家绩效、差评定位 |
 | `mv_payment_dist` | 年-月-支付类型 | 支付偏好分析 |
 
-创建方式（SQLite 用 `CREATE TABLE AS`）：
+创建方式（MySQL 用预聚合表保存结果，必要字段建立索引）：
 ```sql
 -- 示例：mv_monthly_sales
 DROP TABLE IF EXISTS mv_monthly_sales;
 CREATE TABLE mv_monthly_sales AS
 SELECT
-    strftime('%Y-%m', order_purchase_timestamp) AS year_month,
+    DATE_FORMAT(o.order_purchase_timestamp, '%Y-%m') AS year_month,
     COUNT(DISTINCT o.order_id)                  AS total_orders,
     SUM(oi.price + oi.freight_value)            AS total_gmv,
     AVG(oi.price)                               AS avg_price,
@@ -141,6 +143,9 @@ FROM orders o
 JOIN order_items oi ON o.order_id = oi.order_id
 WHERE o.order_status = 'delivered'
 GROUP BY year_month;
+
+CREATE INDEX idx_mv_monthly_sales_year_month
+ON mv_monthly_sales (year_month);
 ```
 
 Agent 在 Prompt 中获得每张视图的字段描述，匹配成功则直接 `SELECT * FROM mv_*`，无匹配时回退到基础表 JOIN。
@@ -204,7 +209,7 @@ Agent 在 Prompt 中获得每张视图的字段描述，匹配成功则直接 `S
 
 具体任务：
 1. 数据清洗脚本（处理 9 张原始 CSV，处理缺失值、时间格式、类别翻译）
-2. SQLite 建库 + 6 张预聚合视图 SQL 编写与验证
+2. MySQL 建库 + 6 张预聚合表 SQL 编写、索引设计与验证
 3. LangGraph StateGraph 搭建（4 个 Agent 节点 + 条件边 + MemorySaver）
 4. 数据分析 Agent 实现（Prompt 设计、视图路由逻辑、SQL 执行）
 5. 协调器 Agent 实现（问题分类、子任务规划）
@@ -244,7 +249,7 @@ Agent 在 Prompt 中获得每张视图的字段描述，匹配成功则直接 `S
 
 | 周次 | 里程碑 | 验收标准 |
 |------|--------|---------|
-| 第1周 | 数据准备完成 | SQLite 建库成功，6张预聚合视图可查询，性能对比数据有记录 |
+| 第1周 | 数据准备完成 | MySQL 建库成功，6张预聚合表可查询，索引生效，性能对比数据有记录 |
 | 第2周 | Agent 框架跑通 | 4个Agent节点联通，能回答"2017年GMV是多少"（命中mv_monthly_sales） |
 | 第3周 | 可视化 + 预测集成 | 7种图表正常渲染，Prophet预测输出置信区间 |
 | 第4周 | Web界面 + 联调 | 多轮对话正常，附录10个问题全部可回答，报告初稿完成 |
