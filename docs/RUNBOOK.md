@@ -38,3 +38,14 @@ uvicorn app:app --reload
 8. `预测未来6期GMV。`
 9. `给出平台整体运营优化建议。`
 10. `分析东北部降低延迟率的策略。`
+
+## 5. 可选启用 Qwen 流式建议
+
+```bash
+export ENABLE_LLM=1
+export QWEN_API_KEY=你的key
+export QWEN_MODEL=qwen3.6-plus
+uvicorn app:app --reload
+```
+
+WebSocket `/ws/analyze` 会先返回计划、SQL、摘要和图表，然后在可用时发送 `llm_delta` 与 `llm_usage` 事件；如果没有 key，会发送 `llm_fallback` 并继续返回本地建议。

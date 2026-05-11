@@ -11,12 +11,14 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from agents.orchestrator import build_plan, run_workflow
+from config.prompts import DECISION_MAKER_SYSTEM_PROMPT
+from utils.llm_client import stream_chat_completion
 from utils.local_store import bootstrap_local_store, table_counts
 
 APP_DIR = Path(__file__).resolve().parent
 DASHBOARD_DIR = APP_DIR / "dashboard"
 
-app = FastAPI(title="Agentic BI Olist", version="0.2.0")
+app = FastAPI(title="Agentic BI Olist", version="0.3.0")
 app.mount("/static", StaticFiles(directory=DASHBOARD_DIR / "static"), name="static")
 
 
@@ -87,7 +89,7 @@ def analyze(payload: AnalyzeRequest) -> AnalyzeResponse:
 
 @app.websocket("/ws/analyze")
 async def analyze_ws(websocket: WebSocket) -> None:
-    """Stream coarse agent milestones for the dashboard."""
+    """Stream agent milestones and optional Qwen recommendation deltas."""
     await websocket.accept()
     question = await websocket.receive_text()
     plan = build_plan(question)
@@ -96,5 +98,21 @@ async def analyze_ws(websocket: WebSocket) -> None:
     await websocket.send_json({"event": "sql", "sql": workflow.data_analysis.sql, "route": workflow.data_analysis.route.route})
     await websocket.send_json({"event": "summary", "summary": workflow.data_analysis.summary, "elapsed_ms": round(workflow.data_analysis.result.elapsed_ms, 2)})
     await websocket.send_json({"event": "chart", "chart_type": workflow.chart_type, "chart_html": workflow.chart_html})
-    await websocket.send_json({"event": "done", "forecast": workflow.forecast, "recommendations": workflow.recommendations})
+    stream_prompt = (
+        f"问题：{question}\n分析类型：{workflow.plan.analysis_type}\n"
+        f"数据摘要：{workflow.data_analysis.summary}\n样例前三行：{workflow.data_analysis.result.rows[:3]}\n"
+        "请流式输出3条中文运营建议，每条包含问题定位、根因、具体行动和预期效果。"
+    )
+    streamed = False
+    for event in stream_chat_completion(DECISION_MAKER_SYSTEM_PROMPT, stream_prompt, max_tokens=420):
+        if event.event == "delta":
+            streamed = True
+            await websocket.send_json({"event": "llm_delta", "content": event.content, "reasoning_content": event.reasoning_content})
+        elif event.event == "usage":
+            await websocket.send_json({"event": "llm_usage", "total_tokens": event.total_tokens})
+        elif event.event == "error":
+            await websocket.send_json({"event": "llm_fallback", "error": event.error})
+        elif event.event == "done":
+            break
+    await websocket.send_json({"event": "done", "streamed_llm": streamed, "forecast": workflow.forecast, "recommendations": workflow.recommendations})
     await websocket.close()

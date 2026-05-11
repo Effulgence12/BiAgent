@@ -61,3 +61,23 @@ def test_render_chart_html_table_fallback():
     html = render_chart_html("table", [{"a": 1, "b": "x"}])
     assert "data-table" in html
     assert "x" in html
+
+from utils.llm_client import _iter_sse_lines, stream_chat_completion
+
+
+def test_sse_parser_handles_qwen_chunks():
+    lines = [
+        b'data: {"choices":[{"delta":{"content":"hello"}}]}\n',
+        b'data: {"usage":{"total_tokens":7},"choices":[]}\n',
+        b'data: [DONE]\n',
+    ]
+    chunks = list(_iter_sse_lines(lines))
+    assert chunks[0]["choices"][0]["delta"]["content"] == "hello"
+    assert chunks[1]["usage"]["total_tokens"] == 7
+    assert chunks[2] == "[DONE]"
+
+
+def test_stream_chat_completion_disabled_falls_back():
+    events = list(stream_chat_completion("system", "user"))
+    assert events[0].event == "error"
+    assert "disabled" in events[0].error

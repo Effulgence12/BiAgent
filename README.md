@@ -12,7 +12,7 @@
 - MySQL 生产 SQL 与本地 SQLite 一键演示双路径；Agent 查询优先命中 `mv_*` 预聚合表。
 - 描述性、诊断性、预测性、规范性四层分析。
 - Web 双栏界面：左侧对话，右侧 SQL、图表、建议与 JSON。
-- 可选 DeepSeek API Key；未配置 Key 时仍可使用本地确定性 Agent 完成演示。
+- 可选 Qwen/DashScope API Key；未配置 Key 时仍可使用本地确定性 Agent 完成演示。
 
 ## 当前实现状态
 
@@ -49,11 +49,12 @@ python cli.py "预测未来6期GMV。"
 复制 `.env.example` 为 `.env` 后填入：
 
 ```bash
-DEEPSEEK_API_KEY=你的key
-DEEPSEEK_MODEL=deepseek-chat
+ENABLE_LLM=1
+QWEN_API_KEY=你的key
+QWEN_MODEL=qwen3.6-plus
 ```
 
-默认一个 Key 供所有 Agent 共享即可。详见 `docs/API_KEY.md`。
+默认一个 Qwen/DashScope Key 供所有 Agent 共享即可。详见 `docs/API_KEY.md`。
 
 ## 数据准备
 
