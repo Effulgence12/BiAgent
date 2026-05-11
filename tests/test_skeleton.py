@@ -1,7 +1,11 @@
-from agents.data_analyst import draft_sql
-from agents.orchestrator import build_plan, classify_question
-from agents.visualizer import choose_chart
-from models.forecast import naive_forecast
+from pathlib import Path
+
+from agents.data_analyst import analyze_question, draft_sql
+from agents.orchestrator import build_plan, classify_question, run_workflow
+from agents.visualizer import choose_chart, render_chart_html
+from models.forecast import linear_forecast, naive_forecast
+from utils.data_bootstrap import generate_demo_csvs, has_required_csvs
+from utils.local_store import bootstrap_local_store, table_counts
 from utils.query_router import decide_query_route, referenced_relations
 
 
@@ -31,3 +35,29 @@ def test_plan_and_forecast_placeholders():
     plan = build_plan("预测未来6周GMV")
     assert plan.analysis_type == "predictive"
     assert naive_forecast([1, 2, 3], periods=3) == [3.0, 3.0, 3.0]
+    forecast = linear_forecast([{"total_gmv": 100}, {"total_gmv": 120}], periods=2)
+    assert forecast[0]["yhat"] > 120
+
+
+def test_demo_dataset_and_local_store(tmp_path: Path):
+    data_dir = tmp_path / "raw"
+    db_path = tmp_path / "agentic_bi.sqlite"
+    generate_demo_csvs(data_dir, orders_count=80)
+    assert has_required_csvs(data_dir)
+    source = bootstrap_local_store(force=True, data_dir=data_dir, db_path=db_path)
+    assert source == "existing_csv"
+    assert db_path.exists()
+
+
+def test_workflow_returns_chart_and_recommendations():
+    workflow = run_workflow("哪些州配送延迟严重？")
+    assert workflow.plan.analysis_type == "diagnostic"
+    assert workflow.data_analysis.result.rows
+    assert "<" in workflow.chart_html
+    assert workflow.recommendations
+
+
+def test_render_chart_html_table_fallback():
+    html = render_chart_html("table", [{"a": 1, "b": "x"}])
+    assert "data-table" in html
+    assert "x" in html

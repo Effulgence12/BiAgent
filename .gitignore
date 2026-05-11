@@ -9,6 +9,7 @@ __pycache__/
 
 # Data and generated artifacts
 data/raw/*.csv
+data/local/
 data/processed/
 reports/screenshots/
 models/cache/

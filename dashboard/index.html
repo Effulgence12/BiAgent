@@ -9,27 +9,32 @@
   <body>
     <header>
       <h1>Agentic BI — Olist 运营分析系统</h1>
-      <p>最小可运行骨架：自然语言问题 → Agent 计划 → 视图优先 SQL → 图表类型与建议占位。</p>
+      <p>自然语言问题 → 多Agent计划 → 视图优先SQL → 可视化 → 预测/建议。</p>
     </header>
     <main class="layout">
       <section class="panel chat-panel">
         <h2>对话区</h2>
         <div id="messages" class="messages">
-          <article class="message assistant">请输入一个 Olist 运营问题，例如：2017年各月GMV趋势？</article>
+          <article class="message assistant">请输入一个 Olist 运营问题，例如：2017年各月GMV趋势？哪些州配送延迟严重？预测未来6期GMV。</article>
         </div>
         <form id="question-form" class="composer">
           <input id="question" name="question" placeholder="输入业务问题..." required />
           <button type="submit">发送</button>
         </form>
+        <button id="bootstrap" class="secondary" type="button">初始化/刷新本地数据</button>
       </section>
       <section class="panel result-panel">
         <h2>分析结果</h2>
         <div class="tabs">
-          <button class="active" type="button">SQL</button>
-          <button type="button">图表</button>
-          <button type="button">建议</button>
+          <button class="tab active" data-target="chart" type="button">图表</button>
+          <button class="tab" data-target="sql" type="button">SQL</button>
+          <button class="tab" data-target="advice" type="button">建议</button>
+          <button class="tab" data-target="raw" type="button">JSON</button>
         </div>
-        <pre id="result" class="result">等待分析请求...</pre>
+        <section id="chart" class="tab-panel active"><p>等待分析请求...</p></section>
+        <section id="sql" class="tab-panel"><pre></pre></section>
+        <section id="advice" class="tab-panel"><p>等待建议...</p></section>
+        <section id="raw" class="tab-panel"><pre></pre></section>
       </section>
     </main>
     <script src="/static/app.js"></script>
