@@ -5,8 +5,10 @@ from __future__ import annotations
 from collections.abc import Sequence
 from datetime import date, timedelta
 from math import sqrt
+import warnings
 
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
+from statsmodels.tools.sm_exceptions import ConvergenceWarning
 
 
 def naive_forecast(values: Sequence[float], periods: int = 6) -> list[float]:
@@ -46,7 +48,13 @@ def linear_forecast(points: Sequence[dict[str, object]], value_key: str = "total
 
 
 def forecast_sales_6_weeks(points: Sequence[dict[str, object]]) -> list[dict[str, float | str]]:
-    """Forecast the next six weekly GMV points with ETS confidence intervals.
+    """Forecast the next six weekly GMV points with ETS confidence intervals."""
+    forecast, _diagnostics = forecast_sales_6_weeks_with_diagnostics(points)
+    return forecast
+
+
+def forecast_sales_6_weeks_with_diagnostics(points: Sequence[dict[str, object]]) -> tuple[list[dict[str, float | str]], dict[str, object]]:
+    """Forecast weekly GMV with ETS and expose model diagnostics.
 
     使用任务书认可的时间序列方法 ETS/指数平滑。所有输入来自真实
     `mv_weekly_sales`，模型失败时抛出真实错误，不生成模拟序列。
@@ -60,14 +68,23 @@ def forecast_sales_6_weeks(points: Sequence[dict[str, object]]) -> list[dict[str
         except (KeyError, TypeError, ValueError):
             continue
     if not values:
-        return []
+        return [], {"model": "ETS", "point_count": 0, "warnings": ["没有可用周GMV序列"]}
     if len(values) < 8:
         raise ValueError("真实周GMV序列不足8周，无法训练稳定的ETS预测模型")
     model = ExponentialSmoothing(values, trend="add", seasonal=None, initialization_method="estimated")
-    fitted = model.fit(optimized=True)
+    captured_warnings: list[str] = []
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", ConvergenceWarning)
+        fitted = model.fit(optimized=True)
+        captured_warnings = [str(item.message) for item in caught if issubclass(item.category, ConvergenceWarning)]
     fitted_values = list(fitted.fittedvalues)
     residuals = [actual - fitted_value for actual, fitted_value in zip(values, fitted_values)]
     residual_std = sqrt(sum(residual * residual for residual in residuals) / max(len(residuals) - 1, 1))
+    recent = list(zip(values[-12:], fitted_values[-12:]))
+    abs_errors = [abs(actual - fitted_value) for actual, fitted_value in recent]
+    pct_errors = [abs(actual - fitted_value) / actual for actual, fitted_value in recent if actual > 0]
+    mae = sum(abs_errors) / len(abs_errors) if abs_errors else 0.0
+    mape = sum(pct_errors) / len(pct_errors) if pct_errors else 0.0
     predictions = [max(0.0, float(value)) for value in fitted.forecast(6)]
     last_week = dates[-1]
     forecast = []
@@ -82,4 +99,12 @@ def forecast_sales_6_weeks(points: Sequence[dict[str, object]]) -> list[dict[str
                 "yhat_upper": round(yhat + band, 2),
             }
         )
-    return forecast
+    diagnostics = {
+        "model": "ETS",
+        "point_count": len(values),
+        "backtest_window": len(abs_errors),
+        "mae": round(mae, 2),
+        "mape": round(mape, 4),
+        "warnings": captured_warnings,
+    }
+    return forecast, diagnostics

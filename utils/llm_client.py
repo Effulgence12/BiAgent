@@ -10,6 +10,8 @@ from __future__ import annotations
 import json
 import os
 import socket
+import time
+import http.client
 import urllib.error
 import urllib.request
 from collections.abc import Generator, Iterable
@@ -94,23 +96,29 @@ def chat_completion(system_prompt: str, user_prompt: str, timeout: int = 45, max
         raise LLMClientError("LLM is disabled by ENABLE_LLM=0")
     if not _api_key():
         raise LLMClientError("QWEN_API_KEY or DASHSCOPE_API_KEY is not configured")
-    try:
-        with urllib.request.urlopen(_request(_payload(system_prompt, user_prompt, max_tokens=max_tokens), timeout), timeout=timeout) as response:
-            data = json.loads(response.read().decode("utf-8"))
-        usage = data.get("usage") or {}
-        return LLMResponse(
-            content=data["choices"][0]["message"].get("content", ""),
-            used_api=True,
-            model=data.get("model", settings.qwen_model),
-            total_tokens=usage.get("total_tokens"),
-        )
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="ignore")[:500]
-        raise LLMClientError(f"LLM HTTP {exc.code}: {detail}") from exc
-    except (TimeoutError, socket.timeout) as exc:
-        raise LLMClientError(f"LLM request timed out: {exc}") from exc
-    except (urllib.error.URLError, KeyError, IndexError, json.JSONDecodeError) as exc:
-        raise LLMClientError(f"LLM request failed: {exc}") from exc
+    last_error: Exception | None = None
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(_request(_payload(system_prompt, user_prompt, max_tokens=max_tokens), timeout), timeout=timeout) as response:
+                data = json.loads(response.read().decode("utf-8"))
+            usage = data.get("usage") or {}
+            return LLMResponse(
+                content=data["choices"][0]["message"].get("content", ""),
+                used_api=True,
+                model=data.get("model", settings.qwen_model),
+                total_tokens=usage.get("total_tokens"),
+            )
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="ignore")[:500]
+            raise LLMClientError(f"LLM HTTP {exc.code}: {detail}") from exc
+        except (TimeoutError, socket.timeout, urllib.error.URLError, http.client.RemoteDisconnected) as exc:
+            last_error = exc
+            if attempt < 2:
+                time.sleep(1.5 * (attempt + 1))
+                continue
+        except (KeyError, IndexError, json.JSONDecodeError) as exc:
+            raise LLMClientError(f"LLM request failed: {exc}") from exc
+    raise LLMClientError(f"LLM request failed after retries: {last_error}") from last_error
 
 
 def _iter_sse_lines(byte_lines: Iterable[bytes]) -> Generator[dict[str, Any] | str, None, None]:
@@ -141,37 +149,54 @@ def stream_chat_completion(system_prompt: str, user_prompt: str, timeout: int = 
     if not _api_key():
         yield LLMStreamEvent(event="error", error="QWEN_API_KEY or DASHSCOPE_API_KEY is not configured")
         return
-    try:
-        with httpx.stream(
-            "POST",
-            _chat_url(),
-            headers={"Content-Type": "application/json", "Authorization": f"Bearer {_api_key()}"},
-            json=_payload(system_prompt, user_prompt, stream=True, max_tokens=max_tokens),
-            timeout=httpx.Timeout(timeout, read=timeout),
-        ) as response:
-            if response.status_code >= 400:
-                yield LLMStreamEvent(event="error", error=f"HTTP {response.status_code}: {response.text[:300]}")
-                return
-            for chunk in _iter_sse_lines(line.encode("utf-8") for line in response.iter_lines()):
-                if chunk == "[DONE]":
-                    yield LLMStreamEvent(event="done")
+    last_error = ""
+    for attempt in range(3):
+        emitted_delta = False
+        try:
+            with httpx.stream(
+                "POST",
+                _chat_url(),
+                headers={"Content-Type": "application/json", "Authorization": f"Bearer {_api_key()}"},
+                json=_payload(system_prompt, user_prompt, stream=True, max_tokens=max_tokens),
+                timeout=httpx.Timeout(timeout, read=timeout),
+            ) as response:
+                if response.status_code >= 400:
+                    error = f"HTTP {response.status_code}: {response.text[:300]}"
+                    if response.status_code >= 500 and attempt < 2:
+                        last_error = error
+                        time.sleep(1.5 * (attempt + 1))
+                        continue
+                    yield LLMStreamEvent(event="error", error=error)
                     return
-                usage = chunk.get("usage") or {}
-                if usage:
-                    yield LLMStreamEvent(event="usage", total_tokens=usage.get("total_tokens"))
-                choices = chunk.get("choices") or []
-                if not choices:
-                    continue
-                delta = choices[0].get("delta") or {}
-                reasoning = delta.get("reasoning_content") or ""
-                content = delta.get("content") or ""
-                if reasoning or content:
-                    yield LLMStreamEvent(event="delta", content=content, reasoning_content=reasoning)
-            yield LLMStreamEvent(event="done")
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="ignore")[:300]
-        yield LLMStreamEvent(event="error", error=f"HTTP {exc.code}: {detail}")
-    except (TimeoutError, socket.timeout) as exc:
-        yield LLMStreamEvent(event="error", error=f"LLM stream timed out: {exc}")
-    except (urllib.error.URLError, httpx.HTTPError) as exc:
-        yield LLMStreamEvent(event="error", error=str(exc))
+                for chunk in _iter_sse_lines(line.encode("utf-8") for line in response.iter_lines()):
+                    if chunk == "[DONE]":
+                        yield LLMStreamEvent(event="done")
+                        return
+                    usage = chunk.get("usage") or {}
+                    if usage:
+                        yield LLMStreamEvent(event="usage", total_tokens=usage.get("total_tokens"))
+                    choices = chunk.get("choices") or []
+                    if not choices:
+                        continue
+                    delta = choices[0].get("delta") or {}
+                    reasoning = delta.get("reasoning_content") or ""
+                    content = delta.get("content") or ""
+                    if reasoning or content:
+                        emitted_delta = True
+                        yield LLMStreamEvent(event="delta", content=content, reasoning_content=reasoning)
+                yield LLMStreamEvent(event="done")
+                return
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="ignore")[:300]
+            yield LLMStreamEvent(event="error", error=f"HTTP {exc.code}: {detail}")
+            return
+        except (TimeoutError, socket.timeout) as exc:
+            error = f"LLM stream timed out: {exc}"
+        except (urllib.error.URLError, httpx.HTTPError) as exc:
+            error = str(exc)
+        last_error = error
+        if emitted_delta or attempt >= 2:
+            yield LLMStreamEvent(event="error", error=error)
+            return
+        time.sleep(1.5 * (attempt + 1))
+    yield LLMStreamEvent(event="error", error=last_error or "LLM stream failed")

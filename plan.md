@@ -4,6 +4,19 @@
 
 ---
 
+## 当前冲刺状态（2026-05-12）
+
+除“精细 ETL、MySQL 接入、正式报告截图、预聚合性能对比”放到最后外，当前主线已推进到可提交质量打磨阶段：
+
+- LLM：已接入 Qwen/DashScope，DataAnalyst 由真实大模型实时规划 SQL；模型失败会真实报错，不使用本地模板兜底。
+- 查询引擎：当前阶段使用 SQLite 承载真实 Olist CSV 与 `mv_*` 预聚合表；MySQL SQL 脚本保留并保持迁移兼容，最后阶段再切换。
+- Agent：LangGraph 已包含 Orchestrator、DataAnalyst、ForecastModel、Visualizer、DecisionMaker，并通过 WebSocket 输出真实执行事件。
+- 可视化：已升级为 Plotly + Folium，返回结构化 `charts[]`，每个图表附带证据数据表。
+- 预测：已从线性趋势升级为 statsmodels ETS，输出 `yhat/yhat_lower/yhat_upper`。
+- 验收：`python cli.py --validate-assignment` 已真实调用 Qwen 跑通附录 10 题，逐题检查命中视图、SQL 任务、直答、图表和预测区间。
+
+---
+
 ## 一、项目目标摘要
 
 构建一个多智能体协作的 BI 分析系统，使非技术用户能通过**自然语言**提问，自动完成：
@@ -19,15 +32,15 @@
 
 | 层次 | 选型 | 理由 |
 |------|------|------|
-| LLM | DeepSeek API（`deepseek-chat`） | 免费额度充足、中文友好、Function Calling 完善 |
+| LLM | Qwen/DashScope OpenAI-compatible API | 中文业务表达稳定，当前 `.env` 已按 Qwen 路线配置 |
 | Agent 框架 | LangGraph | 任务书明确推荐；支持有状态 StateGraph + MemorySaver |
-| 数据库 | MySQL | 任务书明确要求；适合多表 JOIN、预聚合表、索引优化和性能对比演示 |
-| 预测模型 | Prophet（主）| 时序预测首选，自带置信区间；无需 GPU |
+| 数据库 | SQLite（当前调试）+ MySQL（最终迁移） | 当前尚未租好 MySQL 服务器，SQLite 使用真实 CSV 重建；所有 `mv_*` 查询保持 MySQL 可迁移 |
+| 预测模型 | statsmodels ETS | 依赖较轻，属于任务书认可的时间序列模型，输出预测值与置信区间 |
 | 可视化 | Plotly（图表）+ Folium（地图） | Plotly 输出 HTML 可直接嵌 Web；Folium 渲染巴西州热力图 |
 | Web 后端 | FastAPI + WebSocket | 轻量；支持流式返回 Agent 中间过程 |
 | Web 前端 | 原生 HTML/CSS/JS | 无需构建工具；双栏布局简单实现 |
 
-> **MySQL 使用说明**：原始表与预聚合表统一驻留在 MySQL 中。系统通过 `utils/db_init.py` 完成建库、导入、索引创建与预聚合表刷新；DataAnalyst Agent 生成的 SQL 优先查询 `mv_*` 预聚合表，无法覆盖时再回退到基础表 JOIN。
+> **当前数据库说明**：本阶段暂用 SQLite，数据来源必须是 `data/raw/` 的真实 Olist CSV；系统启动/刷新时会校验并构建本地分析库。MySQL 接入、正式截图和性能对比放到最后统一处理。
 
 ---
 
@@ -50,7 +63,7 @@ AgenticBI_Final_Olist/
 │   ├── schema.sql              # MySQL 基础表结构、索引
 │   └── materialized_views.sql  # 预聚合表创建与刷新 SQL
 ├── models/
-│   └── forecast.py             # Prophet 时序预测封装
+│   └── forecast.py             # ETS 时序预测封装
 ├── config/
 │   ├── prompts.py              # 各 Agent 的 System Prompt 模板
 │   └── views_desc.py           # 预聚合视图说明（给 Agent 看）
@@ -96,7 +109,7 @@ AgenticBI_Final_Olist/
 
 图表类型映射：
 - 时序数据 → 折线图（含预测置信区间）
-- 州维度数据 → 地理热力图（Folium + 巴西 GeoJSON）
+- 州维度数据 → Folium 巴西州级气泡地图（基于 geolocation 州质心）
 - 类别对比 → 柱状图/条形图
 - 交叉矩阵 → 热力图（payment × installments）
 - 相关性 → 散点/气泡图（重量 vs 运费）
@@ -104,13 +117,13 @@ AgenticBI_Final_Olist/
 
 ### 4.4 决策智能 Agent（DecisionMaker）
 
-**职责**：整合数据摘要 + 预测结果 → 调用 LLM 推理 → 输出可操作建议
+**职责**：整合数据摘要 + 预测结果 → 调用真实 Qwen 推理 → 输出可操作建议
 
 Prompt 格式：
 ```
 你是 Olist 平台的数据科学顾问，根据以下分析结果给出 3 条具体改进建议：
 [分析数据摘要]
-要求：每条建议包含 问题定位 / 根因 / 具体行动 / 预期效果
+要求：先直接回答用户问题，再给 3 条自然、清楚、可执行的业务建议
 ```
 
 ---
@@ -158,7 +171,7 @@ Agent 在 Prompt 中获得每张视图的字段描述，匹配成功则直接 `S
 |--------|---------|---------|
 | 描述性 | DataAnalyst 查视图 + 统计摘要 | "2017年各月GMV趋势？" |
 | 诊断性 | 多次查询（视图 + 基础表下钻）+ 关联分析 | "哪些州配送延迟严重？" |
-| 预测性 | Prophet 基于 `mv_monthly_sales` 建模，预测未来 6 周 | "预测未来6周销售额" |
+| 预测性 | statsmodels ETS 基于 `mv_weekly_sales` 建模，预测未来 6 周 | "预测未来6周销售额" |
 | 规范性 | DecisionMaker 综合前三层 + LLM 推理 | "给出东北部降低退货率的方案" |
 
 ---
@@ -167,8 +180,8 @@ Agent 在 Prompt 中获得每张视图的字段描述，匹配成功则直接 `S
 
 | 序号 | 图表类型 | 数据来源 |
 |------|---------|---------|
-| 1 | 时序折线图（含预测曲线+置信区间） | `mv_monthly_sales` + Prophet |
-| 2 | 巴西州地理热力图 | `mv_state_sales` + GeoJSON |
+| 1 | 时序折线图（含预测曲线+置信区间） | `mv_monthly_sales`/`mv_weekly_sales` + ETS |
+| 2 | 巴西州地理气泡图 | `mv_state_geo` |
 | 3 | 各州客单价柱状图 | `mv_state_sales` |
 | 4 | 支付方式×分期数热力矩阵 | `mv_payment_dist` |
 | 5 | 重量 vs 运费气泡散点图 | 基础表（products + order_items） |
@@ -194,7 +207,7 @@ Agent 在 Prompt 中获得每张视图的字段描述，匹配成功则直接 `S
 ```
 
 - WebSocket 实时流式返回 Agent 中间步骤
-- 支持多轮对话（LangGraph MemorySaver 维护上下文）
+- 支持多轮对话（当前由 FastAPI 会话内存保存最近 6 轮，并注入 LangGraph 执行问题；持久化 MemorySaver 可作为后续增强）
 - 图表区 Tab 切换，不刷新页面
 
 ---

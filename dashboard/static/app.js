@@ -3,6 +3,7 @@ const input = document.querySelector("#question");
 const messages = document.querySelector("#messages");
 const bootstrapButton = document.querySelector("#bootstrap");
 const sessionLabel = document.querySelector("#session-id");
+const memoryCount = document.querySelector("#memory-count");
 const connectionState = document.querySelector("#connection-state");
 const stageLabel = document.querySelector("#stage-label");
 const downloadChartButton = document.querySelector("#download-chart");
@@ -25,6 +26,7 @@ const panels = {
 
 let activeSocket = null;
 let activeChart = null;
+let lastFailedRequest = null;
 let sessionId = localStorage.getItem("olistAgenticBiSession");
 
 if (!sessionId) {
@@ -45,10 +47,13 @@ function escapeHtml(text) {
     .replaceAll('"', "&quot;");
 }
 
-function appendMessage(text, role) {
+function appendMessage(text, role, extraNode = null) {
   const node = document.createElement("article");
   node.className = `message ${role}`;
-  node.textContent = text;
+  const textNode = document.createElement("div");
+  textNode.textContent = text;
+  node.appendChild(textNode);
+  if (extraNode) node.appendChild(extraNode);
   messages.appendChild(node);
   messages.scrollTop = messages.scrollHeight;
 }
@@ -69,6 +74,7 @@ function activateTab(name) {
   document.querySelectorAll(".tab-panel").forEach((node) => {
     node.classList.toggle("active", node.id === name);
   });
+  if (name === "chart") resizeActivePlot();
 }
 
 function resetResult(text = "正在建立 WebSocket 流式分析，请稍候...") {
@@ -91,13 +97,58 @@ function resetResult(text = "正在建立 WebSocket 流式分析，请稍候..."
   activateTab("overview");
 }
 
+function retryControls() {
+  const wrapper = document.createElement("div");
+  wrapper.className = "retry-actions";
+
+  const retry = document.createElement("button");
+  retry.type = "button";
+  retry.className = "secondary compact";
+  retry.textContent = "重试原问题";
+  retry.disabled = !lastFailedRequest;
+  retry.addEventListener("click", () => {
+    if (!lastFailedRequest) return;
+    const original = lastFailedRequest.question;
+    appendMessage(`重试原问题：${original}`, "user");
+    resetResult("正在携带上次错误上下文重试原问题...");
+    startStreamingAnalysis(original, {
+      retryOf: lastFailedRequest.requestId,
+      errorContext: lastFailedRequest.error,
+    });
+  });
+
+  const copy = document.createElement("button");
+  copy.type = "button";
+  copy.className = "secondary compact";
+  copy.textContent = "复制错误";
+  copy.disabled = !lastFailedRequest?.error;
+  copy.addEventListener("click", async () => {
+    if (!lastFailedRequest?.error) return;
+    await navigator.clipboard.writeText(lastFailedRequest.error);
+  });
+
+  wrapper.append(retry, copy);
+  return wrapper;
+}
+
+function rememberFailure(event, fallbackQuestion) {
+  lastFailedRequest = {
+    requestId: event.request_id || crypto.randomUUID(),
+    question: event.question || fallbackQuestion,
+    error: event.error || "未知错误",
+    event: event.event,
+  };
+}
+
 function setError(text) {
   setStage("失败", "error");
   setPill(connectionState, "错误", "error");
   panels.directAnswer.textContent = text;
-  panels.summary.textContent = "本系统不使用本地模板伪装成功，请根据错误修复后重试。";
-  panels.chartStage.textContent = text;
-  panels.advice.textContent = text;
+  panels.summary.textContent = "本系统不使用本地模板伪装成功；请根据真实错误修复或重试原问题。";
+  panels.chartStage.innerHTML = "";
+  panels.chartStage.append(document.createTextNode(text), retryControls());
+  panels.advice.innerHTML = "";
+  panels.advice.append(document.createTextNode(text), retryControls());
 }
 
 function renderKpis(state) {
@@ -106,13 +157,51 @@ function renderKpis(state) {
     ["命中视图", state.matchedViews?.length ? state.matchedViews.join(", ") : "-"],
     ["查询耗时", state.elapsedMs ? `${state.elapsedMs} ms` : "-"],
     ["图表数量", state.charts?.length ? `${state.charts.length}` : "-"],
+    ["会话记忆", Number.isInteger(state.memoryTurns) ? `${state.memoryTurns} 轮` : "-"],
   ];
   return items
     .map(([label, value]) => `<article class="kpi"><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></article>`)
     .join("");
 }
 
+function agentDetail(event) {
+  if (event.event === "plan") {
+    return {
+      意图: event.intent || "-",
+      分析类型: event.analysis_type || "-",
+      需要Agent: event.required_agents || [],
+      需要视图: event.required_views || [],
+      追问引用: event.followup_reference || "-",
+      是否二次规划: Boolean(event.refined),
+    };
+  }
+  if (event.event === "sql_planned" || event.event === "sql") {
+    return {
+      SQL任务数: event.task_count ?? event.sql_tasks?.length ?? 0,
+      命中视图: event.matched_views || [],
+      路由: event.route || "-",
+      SQL任务: (event.sql_tasks || []).map((task) => ({ name: task.name, purpose: task.purpose })),
+    };
+  }
+  if (event.event === "agent_done" && event.agent === "forecast_model") {
+    return {
+      预测点数: event.forecast_count || 0,
+      模型诊断: event.forecast_diagnostics || {},
+    };
+  }
+  if (event.event === "data_error" || event.event === "llm_error" || event.event === "sql_error") {
+    return {
+      错误类型: event.event,
+      原问题: event.question || "-",
+      请求ID: event.request_id || "-",
+      错误: event.error || "-",
+    };
+  }
+  return null;
+}
+
 function renderAgentEvent(event) {
+  if (event.event === "llm_delta") return;
   const node = document.createElement("li");
   const map = {
     agent_start: `启动 ${event.agent}`,
@@ -124,28 +213,46 @@ function renderAgentEvent(event) {
     summary: `完成真实数据查询 ${event.elapsed_ms ?? ""}ms`,
     chart_done: "生成可视化图表",
     chart: "生成可视化图表",
+    memory: `载入会话记忆 ${event.turn_count || 0} 轮`,
+    memory_updated: `写入会话记忆 ${event.turn_count || 0} 轮`,
     llm_usage: `大模型 token: ${event.total_tokens}`,
+    data_error: "数据错误",
+    llm_error: "大模型错误",
+    sql_error: "SQL规划/执行错误",
     final: "流程完成",
     done: "流程完成",
   };
   node.innerHTML = `<span>${escapeHtml(map[event.event] || event.event)}</span>`;
+  const detail = agentDetail(event);
+  if (detail) {
+    const details = document.createElement("details");
+    details.className = "agent-detail";
+    if (event.event === "plan" || event.event === "sql_planned" || event.event.endsWith("_error")) details.open = true;
+    details.innerHTML = `<summary>查看输入/输出摘要</summary><pre>${escapeHtml(JSON.stringify(detail, null, 2))}</pre>`;
+    node.appendChild(details);
+  }
   panels.agent.appendChild(node);
 }
 
 function setHtmlWithScripts(container, html) {
-  container.innerHTML = "";
-  const template = document.createElement("template");
-  template.innerHTML = html;
-  template.content.childNodes.forEach((node) => {
-    if (node.nodeName.toLowerCase() !== "script") {
-      container.appendChild(node.cloneNode(true));
-      return;
-    }
+  container.innerHTML = html;
+  container.querySelectorAll("details.chart-data").forEach((node) => {
+    node.open = true;
+  });
+  container.querySelectorAll("script").forEach((node) => {
     const script = document.createElement("script");
     [...node.attributes].forEach((attr) => script.setAttribute(attr.name, attr.value));
     script.textContent = node.textContent;
     script.async = false;
-    container.appendChild(script);
+    node.replaceWith(script);
+  });
+  window.setTimeout(resizeActivePlot, 80);
+}
+
+function resizeActivePlot() {
+  if (!window.Plotly || !panels.chartStage) return;
+  panels.chartStage.querySelectorAll(".plotly-graph-div").forEach((plot) => {
+    window.Plotly.Plots.resize(plot);
   });
 }
 
@@ -204,19 +311,24 @@ function renderCharts(charts, fallbackHtml = "") {
 
 function appendAdviceDelta(state, content) {
   if (!content) return;
-  if (!state.adviceText) {
-    panels.advice.textContent = "";
-  }
+  if (!state.adviceText) panels.advice.textContent = "";
   state.adviceText += content;
   panels.advice.textContent += content;
 }
 
-function renderForecast(forecast) {
-  if (!forecast?.length) {
+function renderForecast(forecast, diagnostics = {}) {
+  if (!forecast?.length && !Object.keys(diagnostics || {}).length) {
     panels.forecast.innerHTML = "";
     return;
   }
-  panels.forecast.innerHTML = `<h3>预测区间</h3><pre>${escapeHtml(JSON.stringify(forecast, null, 2))}</pre>`;
+  const diagRows = Object.entries(diagnostics || {})
+    .map(([key, value]) => `<tr><th>${escapeHtml(key)}</th><td>${escapeHtml(Array.isArray(value) ? value.join("; ") : JSON.stringify(value))}</td></tr>`)
+    .join("");
+  panels.forecast.innerHTML = `
+    <h3>预测区间与模型诊断</h3>
+    ${diagRows ? `<table class="data-table forecast-diagnostics"><tbody>${diagRows}</tbody></table>` : ""}
+    ${forecast?.length ? `<pre>${escapeHtml(JSON.stringify(forecast, null, 2))}</pre>` : ""}
+  `;
 }
 
 function wsUrl(path) {
@@ -224,7 +336,7 @@ function wsUrl(path) {
   return `${protocol}//${window.location.host}${path}`;
 }
 
-function startStreamingAnalysis(question) {
+function startStreamingAnalysis(question, options = {}) {
   if (activeSocket && activeSocket.readyState === WebSocket.OPEN) {
     activeSocket.close();
   }
@@ -238,7 +350,9 @@ function startStreamingAnalysis(question) {
     summary: "",
     charts: [],
     forecast: [],
+    forecastDiagnostics: {},
     adviceText: "",
+    memoryTurns: 0,
     events: [],
     finished: false,
     failed: false,
@@ -261,7 +375,12 @@ function startStreamingAnalysis(question) {
 
   socket.addEventListener("open", () => {
     setPill(connectionState, "流式连接", "running");
-    socket.send(JSON.stringify({ session_id: sessionId, question }));
+    socket.send(JSON.stringify({
+      session_id: sessionId,
+      question,
+      retry_of: options.retryOf || "",
+      error_context: options.errorContext || "",
+    }));
   });
 
   socket.addEventListener("message", (message) => {
@@ -274,6 +393,14 @@ function startStreamingAnalysis(question) {
       sessionId = event.session_id;
       localStorage.setItem("olistAgenticBiSession", sessionId);
       sessionLabel.textContent = shortSession(sessionId);
+      return;
+    }
+
+    if (event.event === "memory" || event.event === "memory_updated") {
+      state.memoryTurns = event.turn_count || 0;
+      memoryCount.textContent = `记忆 ${state.memoryTurns} 轮`;
+      panels.kpis.innerHTML = renderKpis(state);
+      if (event.last_question) panels.summary.textContent = `已载入上一轮上下文：${event.last_question}`;
       return;
     }
 
@@ -316,16 +443,18 @@ function startStreamingAnalysis(question) {
 
     if (event.event === "data_error" || event.event === "llm_error" || event.event === "sql_error") {
       state.failed = true;
-      const label = event.event === "data_error" ? "数据错误" : event.event === "llm_error" ? "大模型错误" : "SQL规划错误";
+      rememberFailure(event, question);
+      const label = event.event === "data_error" ? "数据错误" : event.event === "llm_error" ? "大模型错误" : "SQL规划/执行错误";
       setError(`${label}：${event.error}`);
-      appendMessage(`${label}：${event.error}`, "assistant");
+      appendMessage(`${label}：${event.error}`, "assistant", retryControls());
       return;
     }
 
     if (event.event === "final" || event.event === "done") {
       state.finished = true;
       state.forecast = event.forecast || [];
-      renderForecast(state.forecast);
+      state.forecastDiagnostics = event.forecast_diagnostics || {};
+      renderForecast(state.forecast, state.forecastDiagnostics);
       scheduleRawRender(true);
       setStage("完成", "done");
       setPill(connectionState, "就绪", "idle");
@@ -338,14 +467,16 @@ function startStreamingAnalysis(question) {
 
   socket.addEventListener("error", () => {
     state.failed = true;
+    rememberFailure({ event: "socket_error", error: "WebSocket 连接失败" }, question);
     setError("WebSocket 连接失败，请检查后端是否启动。");
-    appendMessage("WebSocket 连接失败，请检查后端是否启动。", "assistant");
+    appendMessage("WebSocket 连接失败，请检查后端是否启动。", "assistant", retryControls());
   });
 
   socket.addEventListener("close", () => {
     if (!state.finished && !state.failed) {
+      rememberFailure({ event: "socket_closed", error: "流式连接提前关闭" }, question);
       setError("流式连接提前关闭，请检查后端日志。");
-      appendMessage("流式连接提前关闭，请检查后端日志。", "assistant");
+      appendMessage("流式连接提前关闭，请检查后端日志。", "assistant", retryControls());
     }
   });
 }
@@ -369,7 +500,7 @@ bootstrapButton.addEventListener("click", async () => {
   if (!response.ok) {
     const detail = data.detail || `请求失败：${response.status}`;
     setError(detail);
-    appendMessage(`数据初始化失败：${detail}`, "assistant");
+    appendMessage(`数据初始化失败：${detail}`, "assistant", retryControls());
     return;
   }
   setStage("数据就绪", "done");

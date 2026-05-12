@@ -9,7 +9,7 @@ from agents.data_analyst import DataAnalysis, analyze_question
 from agents.decision_maker import build_recommendations
 from agents.visualizer import choose_chart, render_charts
 from langgraph.graph import END, StateGraph
-from models.forecast import forecast_sales_6_weeks
+from models.forecast import forecast_sales_6_weeks_with_diagnostics
 
 
 @dataclass(frozen=True)
@@ -18,6 +18,10 @@ class AnalysisPlan:
 
     analysis_type: str
     steps: tuple[str, ...]
+    intent: str = ""
+    required_agents: tuple[str, ...] = ()
+    required_views: tuple[str, ...] = ()
+    followup_reference: str = ""
 
 
 @dataclass(frozen=True)
@@ -31,6 +35,7 @@ class WorkflowResult:
     charts: list[dict[str, str]]
     recommendations: list[str]
     forecast: list[dict[str, float | str]]
+    forecast_diagnostics: dict[str, object]
 
 
 class WorkflowState(TypedDict, total=False):
@@ -45,6 +50,7 @@ class WorkflowState(TypedDict, total=False):
     charts: list[dict[str, str]]
     recommendations: list[str]
     forecast: list[dict[str, float | str]]
+    forecast_diagnostics: dict[str, object]
 
 
 def classify_question(question: str) -> str:
@@ -59,28 +65,71 @@ def classify_question(question: str) -> str:
     return "descriptive"
 
 
+def _required_views(question: str, analysis_type: str) -> tuple[str, ...]:
+    text = question.lower()
+    views: list[str] = []
+    if any(keyword in text for keyword in ("gmv", "销售", "销售额", "趋势", "月")):
+        views.extend(["mv_monthly_sales", "mv_state_sales"])
+    if any(keyword in text for keyword in ("州", "地图", "地理", "巴西", "区域", "东北")):
+        views.extend(["mv_state_sales", "mv_state_geo"])
+    if any(keyword in text for keyword in ("配送", "交付", "延迟", "准时", "delivery")):
+        views.append("mv_delivery_perf")
+    if any(keyword in text for keyword in ("支付", "分期", "payment")):
+        views.append("mv_payment_dist")
+    if any(keyword in text for keyword in ("品类", "类目", "category")):
+        views.append("mv_category_sales")
+    if any(keyword in text for keyword in ("差评", "低分", "评分", "评价", "评论", "退货", "review")):
+        views.append("mv_review_category_perf")
+    if any(keyword in text for keyword in ("卖家", "seller")):
+        views.append("mv_seller_perf")
+    if any(keyword in text for keyword in ("重量", "尺寸", "体积", "运费", "weight", "freight")):
+        views.append("mv_weight_freight")
+    if analysis_type == "predictive":
+        views.extend(["mv_monthly_sales", "mv_weekly_sales"])
+    if analysis_type == "prescriptive":
+        views.extend(["mv_monthly_sales", "mv_state_sales", "mv_delivery_perf", "mv_category_sales", "mv_payment_dist", "mv_review_category_perf"])
+    return tuple(dict.fromkeys(views))
+
+
+def _followup_reference(question: str) -> str:
+    text = question.lower()
+    if any(keyword in text for keyword in ("继续", "刚才", "其中", "该", "这个", "那个", "重试")):
+        return "previous_turn"
+    return ""
+
+
 def build_plan(question: str) -> AnalysisPlan:
     """Build a conservative multi-agent execution plan for a user question."""
     analysis_type = classify_question(question)
-    return _plan_for_type(analysis_type)
+    return _plan_for_type(analysis_type, question)
 
 
-def _plan_for_type(analysis_type: str) -> AnalysisPlan:
+def _plan_for_type(analysis_type: str, question: str = "") -> AnalysisPlan:
     """Create the shared agent path for a chosen BI analysis type."""
     common_steps = [
         "Orchestrator: classify question and choose agent path",
         "DataAnalyst: route SQL with mv_* priority and summarize data",
         "Visualizer: render chart/table from result shape",
     ]
+    required_agents = ["orchestrator", "data_analyst", "visualizer"]
     if analysis_type == "predictive":
         steps = common_steps + ["ForecastModel: forecast requested time series", "DecisionMaker: summarize forecast implications"]
+        required_agents.insert(2, "forecast_model")
     elif analysis_type == "prescriptive":
         steps = common_steps + ["DecisionMaker: generate actionable recommendations"]
     elif analysis_type == "diagnostic":
         steps = common_steps + ["DecisionMaker: explain likely root causes"]
     else:
         steps = common_steps + ["DecisionMaker: summarize descriptive findings"]
-    return AnalysisPlan(analysis_type=analysis_type, steps=tuple(steps))
+    required_agents.append("decision_maker")
+    return AnalysisPlan(
+        analysis_type=analysis_type,
+        steps=tuple(steps),
+        intent=question,
+        required_agents=tuple(dict.fromkeys(required_agents)),
+        required_views=_required_views(question, analysis_type),
+        followup_reference=_followup_reference(question),
+    )
 
 
 def _plan_node(state: WorkflowState) -> WorkflowState:
@@ -114,7 +163,7 @@ def _refine_plan_node(state: WorkflowState) -> WorkflowState:
         analysis_type = original.analysis_type
     if analysis_type == original.analysis_type:
         return {"plan": original}
-    return {"plan": _plan_for_type(analysis_type)}
+    return {"plan": _plan_for_type(analysis_type, question)}
 
 
 def _forecast_node(state: WorkflowState) -> WorkflowState:
@@ -127,8 +176,10 @@ def _forecast_node(state: WorkflowState) -> WorkflowState:
         ),
         None,
     )
-    forecast = forecast_sales_6_weeks(weekly_result.rows) if weekly_result else []
-    return {"forecast": forecast}
+    if not weekly_result:
+        return {"forecast": [], "forecast_diagnostics": {"model": "ETS", "point_count": 0, "warnings": ["未命中周度GMV序列"]}}
+    forecast, diagnostics = forecast_sales_6_weeks_with_diagnostics(weekly_result.rows)
+    return {"forecast": forecast, "forecast_diagnostics": diagnostics}
 
 
 def _visualizer_node(state: WorkflowState) -> WorkflowState:
@@ -170,7 +221,11 @@ def _build_workflow_graph():
     graph.set_entry_point("orchestrator")
     graph.add_edge("orchestrator", "data_analyst")
     graph.add_edge("data_analyst", "orchestrator_refine")
-    graph.add_edge("orchestrator_refine", "forecast_model")
+    graph.add_conditional_edges(
+        "orchestrator_refine",
+        lambda state: "forecast_model" if state["plan"].analysis_type == "predictive" else "visualizer",
+        {"forecast_model": "forecast_model", "visualizer": "visualizer"},
+    )
     graph.add_edge("forecast_model", "visualizer")
     graph.add_edge("visualizer", "decision_maker")
     graph.add_edge("decision_maker", END)
@@ -192,5 +247,6 @@ def run_workflow(question: str, generate_recommendations: bool = True) -> Workfl
         chart_html=state["chart_html"],
         charts=state["charts"],
         recommendations=state["recommendations"],
-        forecast=state["forecast"],
+        forecast=state.get("forecast", []),
+        forecast_diagnostics=state.get("forecast_diagnostics", {}),
     )

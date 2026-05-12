@@ -129,6 +129,17 @@ def _table_html(rows: list[dict[str, Any]], limit: int = 30) -> str:
     return f"<table class='data-table'><thead><tr>{header}</tr></thead><tbody>{''.join(body)}</tbody></table>"
 
 
+def _with_evidence_table(chart_html: str, result: QueryResult) -> str:
+    """Attach the queried rows under every chart so the dashboard shows chart + evidence."""
+    return (
+        f"<div class='chart-visual'>{chart_html}</div>"
+        "<details class='chart-data' open>"
+        f"<summary>数据表（前 {min(30, len(result.rows))} 行）</summary>"
+        f"{_table_html(result.rows)}"
+        "</details>"
+    )
+
+
 def _chart_id(prefix: str) -> str:
     return f"{prefix}-{uuid4().hex[:8]}"
 
@@ -155,7 +166,7 @@ def _line_chart(name: str, result: QueryResult, forecast: list[dict[str, Any]], 
         fig.add_trace(go.Scatter(x=[row["week_start"] for row in forecast], y=[row["yhat"] for row in forecast], mode="lines+markers", name="未来6周预测"))
     title = "GMV趋势与未来6周预测" if forecast else "GMV时间序列趋势"
     fig.update_layout(title=title, xaxis_title="时间", yaxis_title="GMV")
-    return ChartSpec(_chart_id("trend"), title, "plotly_line", _source_view(name, result), _plotly_html(fig, include_js), "展示历史GMV趋势；预测题会叠加未来6周预测和置信区间。")
+    return ChartSpec(_chart_id("trend"), title, "plotly_line", _source_view(name, result), _with_evidence_table(_plotly_html(fig, include_js), result), "展示历史GMV趋势；预测题会叠加未来6周预测和置信区间。")
 
 
 def _bar_chart(name: str, result: QueryResult, include_js: bool) -> ChartSpec:
@@ -178,7 +189,7 @@ def _bar_chart(name: str, result: QueryResult, include_js: bool) -> ChartSpec:
     elif "category" in label_key:
         title = "品类表现排名"
     fig.update_layout(title=title, xaxis_title=value_key, yaxis_title=label_key)
-    return ChartSpec(_chart_id("bar"), title, "plotly_bar", _source_view(name, result), _plotly_html(fig, include_js), f"按 {label_key} 对 {value_key} 做排名对比。")
+    return ChartSpec(_chart_id("bar"), title, "plotly_bar", _source_view(name, result), _with_evidence_table(_plotly_html(fig, include_js), result), f"按 {label_key} 对 {value_key} 做排名对比。")
 
 
 def _heatmap_chart(name: str, result: QueryResult, include_js: bool) -> ChartSpec:
@@ -189,7 +200,7 @@ def _heatmap_chart(name: str, result: QueryResult, include_js: bool) -> ChartSpe
     z = [[lookup.get((x, y), 0.0) for x in x_values] for y in y_values]
     fig = go.Figure(data=go.Heatmap(x=x_values, y=y_values, z=z, colorscale="Blues", hoverongaps=False))
     fig.update_layout(title="支付方式 x 分期数热力图", xaxis_title="支付方式", yaxis_title="分期数")
-    return ChartSpec(_chart_id("heatmap"), "支付方式 x 分期数热力图", "plotly_heatmap", _source_view(name, result), _plotly_html(fig, include_js), "展示支付方式与分期数的交叉分布。")
+    return ChartSpec(_chart_id("heatmap"), "支付方式 x 分期数热力图", "plotly_heatmap", _source_view(name, result), _with_evidence_table(_plotly_html(fig, include_js), result), "展示支付方式与分期数的交叉分布。")
 
 
 def _bubble_chart(name: str, result: QueryResult, include_js: bool) -> ChartSpec:
@@ -216,7 +227,7 @@ def _bubble_chart(name: str, result: QueryResult, include_js: bool) -> ChartSpec
         )
     )
     fig.update_layout(title="产品重量/体积与运费关系", xaxis_title=x_key, yaxis_title=y_key)
-    return ChartSpec(_chart_id("bubble"), "产品重量/体积与运费关系", "plotly_bubble", _source_view(name, result), _plotly_html(fig, include_js), "气泡大小表示订单量，颜色区分配送状态或地区。")
+    return ChartSpec(_chart_id("bubble"), "产品重量/体积与运费关系", "plotly_bubble", _source_view(name, result), _with_evidence_table(_plotly_html(fig, include_js), result), "气泡大小表示订单量，颜色区分配送状态或地区。")
 
 
 def _geo_map(name: str, result: QueryResult) -> ChartSpec:
@@ -235,7 +246,7 @@ def _geo_map(name: str, result: QueryResult) -> ChartSpec:
             fill_opacity=0.58,
             popup=f"{row.get('customer_state')}<br>GMV: {value:,.2f}<br>Orders: {row.get('total_orders')}",
         ).add_to(fmap)
-    return ChartSpec(_chart_id("map"), "巴西州级销售气泡地图", "folium_map", _source_view(name, result), fmap._repr_html_(), "基于州质心经纬度展示销售额和订单量分布。")
+    return ChartSpec(_chart_id("map"), "巴西州级销售气泡地图", "folium_map", _source_view(name, result), _with_evidence_table(fmap._repr_html_(), result), "基于州质心经纬度展示销售额和订单量分布。")
 
 
 def _review_reason_chart(name: str, result: QueryResult, include_js: bool) -> ChartSpec:
@@ -254,7 +265,7 @@ def _review_reason_chart(name: str, result: QueryResult, include_js: bool) -> Ch
     if not fig.data:
         return _bar_chart(name, result, include_js)
     fig.update_layout(title="差评品类与主要原因", barmode="stack", yaxis=dict(autorange="reversed"), xaxis_title="差评次数")
-    return ChartSpec(_chart_id("review"), "差评品类与主要原因", "plotly_stacked_bar", _source_view(name, result), _plotly_html(fig, include_js), "展示Top差评品类及物流、质量、错发、客服等原因结构。")
+    return ChartSpec(_chart_id("review"), "差评品类与主要原因", "plotly_stacked_bar", _source_view(name, result), _with_evidence_table(_plotly_html(fig, include_js), result), "展示Top差评品类及物流、质量、错发、客服等原因结构。")
 
 
 def _table_chart(name: str, result: QueryResult) -> ChartSpec:

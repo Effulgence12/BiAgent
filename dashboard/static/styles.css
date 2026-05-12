@@ -59,6 +59,7 @@ h3 {
 }
 
 .session-card span,
+.session-card small,
 .muted {
   color: #64748b;
   font-size: 13px;
@@ -300,6 +301,36 @@ button:disabled {
   padding: 12px;
 }
 
+.chart-visual {
+  min-width: 0;
+}
+
+.chart-visual iframe,
+.chart-stage iframe {
+  width: 100%;
+  min-height: 520px;
+  border: 0;
+}
+
+.chart-data {
+  margin-top: 12px;
+  border: 1px solid #dce3ee;
+  border-radius: 8px;
+  background: #f8fafc;
+  overflow: auto;
+}
+
+.chart-data summary {
+  cursor: pointer;
+  padding: 10px 12px;
+  color: #1e293b;
+  font-weight: 700;
+}
+
+.chart-data .data-table {
+  background: #ffffff;
+}
+
 pre {
   min-height: 560px;
   overflow: auto;
@@ -325,11 +356,39 @@ pre {
   line-height: 1.5;
 }
 
+.agent-detail {
+  margin-top: 8px;
+  border: 1px solid #dce3ee;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.agent-detail summary {
+  cursor: pointer;
+  padding: 8px 10px;
+  color: #1e293b;
+  font-weight: 700;
+}
+
+.agent-detail pre {
+  min-height: 0;
+  margin: 0;
+  border-radius: 0 0 8px 8px;
+  font-size: 12px;
+}
+
 .advice-stream {
   min-height: 220px;
   white-space: pre-wrap;
   line-height: 1.75;
   color: #1e293b;
+}
+
+.retry-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 12px;
 }
 
 .forecast-block {
@@ -358,6 +417,14 @@ pre {
 }
 
 .data-table th { background: #edf4ff; }
+
+.forecast-diagnostics {
+  margin-bottom: 12px;
+}
+
+.forecast-diagnostics th {
+  width: 180px;
+}
 
 @media (max-width: 1100px) {
   .layout {

@@ -53,6 +53,8 @@ MATERIALIZED_VIEWS = {
             "delay_complaints",
             "quality_complaints",
             "wrong_item_complaints",
+            "service_complaints",
+            "other_complaints",
         ],
     },
     "mv_weight_freight": {
