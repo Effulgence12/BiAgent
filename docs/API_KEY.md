@@ -11,7 +11,7 @@ ENABLE_LLM=1
 QWEN_API_KEY=你的key
 # 或使用官方文档常见变量名：DASHSCOPE_API_KEY=你的key
 QWEN_MODEL=qwen3.6-plus
-QWEN_BASE_URL=https://dashscope-intl.aliyuncs.com/compatible-mode/v1
+QWEN_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 ```
 
 > 安全提醒：不要把真实 key 写入 Git；不要截图或公开分享 `.env`。
@@ -20,7 +20,7 @@ QWEN_BASE_URL=https://dashscope-intl.aliyuncs.com/compatible-mode/v1
 
 项目使用 Qwen Cloud / DashScope 的 OpenAI-compatible Chat Completions 接口：
 
-- Base URL：`https://dashscope-intl.aliyuncs.com/compatible-mode/v1`
+- Base URL：`https://dashscope.aliyuncs.com/compatible-mode/v1`
 - Chat path：`/chat/completions`
 - Header：`Authorization: Bearer <QWEN_API_KEY 或 DASHSCOPE_API_KEY>`
 - 默认模型：`qwen3.6-plus`

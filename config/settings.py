@@ -6,8 +6,11 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
+load_dotenv(ROOT_DIR / ".env")
 
 
 def _bool_env(name: str, default: str = "0") -> bool:
@@ -20,7 +23,7 @@ class Settings:
 
     qwen_api_key: str = os.getenv("QWEN_API_KEY", os.getenv("DASHSCOPE_API_KEY", ""))
     qwen_model: str = os.getenv("QWEN_MODEL", "qwen3.6-plus")
-    qwen_base_url: str = os.getenv("QWEN_BASE_URL", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1")
+    qwen_base_url: str = os.getenv("QWEN_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
     enable_llm: bool = _bool_env("ENABLE_LLM", "0")
     llm_temperature: float = float(os.getenv("LLM_TEMPERATURE", "0.2"))
     llm_max_tokens: int = int(os.getenv("LLM_MAX_TOKENS", "512"))

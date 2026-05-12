@@ -50,6 +50,21 @@ CREATE TABLE IF NOT EXISTS sellers (
   INDEX idx_sellers_state (seller_state)
 );
 
+CREATE TABLE IF NOT EXISTS geolocation (
+  geolocation_zip_code_prefix INT,
+  geolocation_lat DECIMAL(10, 7),
+  geolocation_lng DECIMAL(10, 7),
+  geolocation_city VARCHAR(128),
+  geolocation_state CHAR(2),
+  INDEX idx_geolocation_zip (geolocation_zip_code_prefix),
+  INDEX idx_geolocation_state (geolocation_state)
+);
+
+CREATE TABLE IF NOT EXISTS product_category_name_translation (
+  product_category_name VARCHAR(128) PRIMARY KEY,
+  product_category_name_english VARCHAR(128)
+);
+
 CREATE TABLE IF NOT EXISTS order_items (
   order_id VARCHAR(64) NOT NULL,
   order_item_id INT NOT NULL,

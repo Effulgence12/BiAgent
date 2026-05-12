@@ -1,18 +1,22 @@
-"""OpenAI-compatible Qwen/DashScope chat client with safe local fallback.
+"""OpenAI-compatible Qwen/DashScope chat client.
 
 The project uses the OpenAI-compatible DashScope endpoint documented by Qwen Cloud.
 No API key is stored in code; set QWEN_API_KEY or DASHSCOPE_API_KEY at runtime.
+LLM failures are surfaced explicitly instead of being replaced by local advice.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import socket
 import urllib.error
 import urllib.request
 from collections.abc import Generator, Iterable
 from dataclasses import dataclass
 from typing import Any
+
+import httpx
 
 from config.settings import settings
 
@@ -40,6 +44,10 @@ class LLMStreamEvent:
     error: str = ""
 
 
+class LLMClientError(RuntimeError):
+    """Raised when the configured remote LLM cannot produce a real response."""
+
+
 def _api_key() -> str:
     """Return the configured Qwen/DashScope key, supporting legacy env names."""
     return settings.qwen_api_key or os.getenv("DASHSCOPE_API_KEY", "") or settings.deepseek_api_key
@@ -62,8 +70,8 @@ def _payload(system_prompt: str, user_prompt: str, *, stream: bool = False, max_
         ],
         "temperature": settings.llm_temperature,
         "max_tokens": max_tokens or settings.llm_max_tokens,
-        # Disable thinking for routine BI copy-editing to reduce latency and token use.
-        "extra_body": {"enable_thinking": False},
+        # 手写 HTTP JSON 时需要放在顶层；OpenAI SDK 的 extra_body 包装在这里不会生效。
+        "enable_thinking": False,
     }
     if stream:
         payload["stream"] = True
@@ -81,11 +89,11 @@ def _request(payload: dict[str, Any], timeout: int) -> urllib.request.Request:
 
 
 def chat_completion(system_prompt: str, user_prompt: str, timeout: int = 45, max_tokens: int | None = None) -> LLMResponse:
-    """Call Qwen chat completions when QWEN_API_KEY/DASHSCOPE_API_KEY is configured."""
+    """Call Qwen chat completions and fail loudly when the API is unavailable."""
     if not settings.enable_llm:
-        return LLMResponse(content="", used_api=False, model=settings.qwen_model, error="LLM is disabled by ENABLE_LLM=0")
+        raise LLMClientError("LLM is disabled by ENABLE_LLM=0")
     if not _api_key():
-        return LLMResponse(content="", used_api=False, model=settings.qwen_model, error="QWEN_API_KEY or DASHSCOPE_API_KEY is not configured")
+        raise LLMClientError("QWEN_API_KEY or DASHSCOPE_API_KEY is not configured")
     try:
         with urllib.request.urlopen(_request(_payload(system_prompt, user_prompt, max_tokens=max_tokens), timeout), timeout=timeout) as response:
             data = json.loads(response.read().decode("utf-8"))
@@ -96,8 +104,13 @@ def chat_completion(system_prompt: str, user_prompt: str, timeout: int = 45, max
             model=data.get("model", settings.qwen_model),
             total_tokens=usage.get("total_tokens"),
         )
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="ignore")[:500]
+        raise LLMClientError(f"LLM HTTP {exc.code}: {detail}") from exc
+    except (TimeoutError, socket.timeout) as exc:
+        raise LLMClientError(f"LLM request timed out: {exc}") from exc
     except (urllib.error.URLError, KeyError, IndexError, json.JSONDecodeError) as exc:
-        return LLMResponse(content="", used_api=False, model=settings.qwen_model, error=str(exc))
+        raise LLMClientError(f"LLM request failed: {exc}") from exc
 
 
 def _iter_sse_lines(byte_lines: Iterable[bytes]) -> Generator[dict[str, Any] | str, None, None]:
@@ -129,8 +142,17 @@ def stream_chat_completion(system_prompt: str, user_prompt: str, timeout: int = 
         yield LLMStreamEvent(event="error", error="QWEN_API_KEY or DASHSCOPE_API_KEY is not configured")
         return
     try:
-        with urllib.request.urlopen(_request(_payload(system_prompt, user_prompt, stream=True, max_tokens=max_tokens), timeout), timeout=timeout) as response:
-            for chunk in _iter_sse_lines(response):
+        with httpx.stream(
+            "POST",
+            _chat_url(),
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {_api_key()}"},
+            json=_payload(system_prompt, user_prompt, stream=True, max_tokens=max_tokens),
+            timeout=httpx.Timeout(timeout, read=timeout),
+        ) as response:
+            if response.status_code >= 400:
+                yield LLMStreamEvent(event="error", error=f"HTTP {response.status_code}: {response.text[:300]}")
+                return
+            for chunk in _iter_sse_lines(line.encode("utf-8") for line in response.iter_lines()):
                 if chunk == "[DONE]":
                     yield LLMStreamEvent(event="done")
                     return
@@ -149,5 +171,7 @@ def stream_chat_completion(system_prompt: str, user_prompt: str, timeout: int = 
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="ignore")[:300]
         yield LLMStreamEvent(event="error", error=f"HTTP {exc.code}: {detail}")
-    except urllib.error.URLError as exc:
+    except (TimeoutError, socket.timeout) as exc:
+        yield LLMStreamEvent(event="error", error=f"LLM stream timed out: {exc}")
+    except (urllib.error.URLError, httpx.HTTPError) as exc:
         yield LLMStreamEvent(event="error", error=str(exc))

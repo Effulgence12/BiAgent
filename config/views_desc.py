@@ -31,6 +31,43 @@ MATERIALIZED_VIEWS = {
         "purpose": "Payment preference, installment mix, and payment heatmap analysis.",
         "columns": ["year_month", "payment_type", "payment_installments", "payment_count", "payment_value"],
     },
+    "mv_weekly_sales": {
+        "grain": "week_start",
+        "purpose": "Weekly GMV series used for the required six-week sales forecast.",
+        "columns": ["week_start", "total_orders", "total_gmv", "avg_order_value"],
+    },
+    "mv_state_geo": {
+        "grain": "customer_state",
+        "purpose": "State-level sales joined with geolocation centroids for maps.",
+        "columns": ["customer_state", "lat", "lng", "total_orders", "total_gmv", "avg_order_value"],
+    },
+    "mv_review_category_perf": {
+        "grain": "product_category_name",
+        "purpose": "Category review score, negative review rate, and bad-review reason signals.",
+        "columns": [
+            "product_category_name",
+            "total_reviews",
+            "avg_review_score",
+            "negative_reviews",
+            "negative_rate",
+            "delay_complaints",
+            "quality_complaints",
+            "wrong_item_complaints",
+        ],
+    },
+    "mv_weight_freight": {
+        "grain": "weight_bucket + delivery_status",
+        "purpose": "Product weight/volume versus freight relationship for bubble scatter charts.",
+        "columns": [
+            "weight_bucket",
+            "delivery_status",
+            "order_count",
+            "avg_weight_g",
+            "avg_volume_cm3",
+            "avg_freight",
+            "avg_price",
+        ],
+    },
 }
 
 VIEW_NAMES = tuple(MATERIALIZED_VIEWS.keys())

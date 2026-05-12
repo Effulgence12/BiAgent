@@ -9,21 +9,23 @@
 核心能力：
 
 - 自然语言问题解析与多 Agent 协作编排。
-- MySQL 生产 SQL 与本地 SQLite 一键演示双路径；Agent 查询优先命中 `mv_*` 预聚合表。
+- MySQL 生产 SQL 与当前阶段 SQLite 本地查询双路径；SQLite 只作为临时查询引擎，数据必须来自真实 Olist CSV，Agent 查询优先命中 `mv_*` 预聚合表。
 - 描述性、诊断性、预测性、规范性四层分析。
 - Web 双栏界面：左侧对话，右侧 SQL、图表、建议与 JSON。
-- 可选 Qwen/DashScope API Key；未配置 Key 时仍可使用本地确定性 Agent 完成演示。
+- 必须配置可用 Qwen/DashScope API Key；模型不可用时接口返回明确错误，不生成本地假建议。
 
 ## 当前实现状态
 
 - `app.py`：FastAPI 入口，包含健康检查、数据初始化、同步分析接口与 WebSocket 流式接口。
-- `agents/`：Orchestrator、DataAnalyst、Visualizer、DecisionMaker 的可运行实现。
-- `utils/`：数据下载/模拟生成、本地分析库、数据字典与 SQL 路由判断。
-- `sql/`：MySQL 基础表结构与 6 张预聚合表刷新 SQL。
+- `agents/`：LangGraph 编排的 Orchestrator、DataAnalyst、ForecastModel、Visualizer、DecisionMaker 可运行实现。
+- `utils/`：真实 CSV 校验、本地分析库、数据字典与 SQL 路由判断。
+- `sql/`：MySQL 基础表结构与 10 张预聚合表刷新 SQL。
 - `dashboard/`：原生 HTML/CSS/JS 双栏交互页面。
 - `docs/`：骨架说明、API Key 说明、运行与验收手册。
 
 ## 快速启动
+
+使用 linux 终端：
 
 ```bash
 python -m venv .venv
@@ -32,9 +34,16 @@ pip install -r requirements.txt
 uvicorn app:app --reload
 ```
 
+如果使用 conda 管理环境，则使用当前项目环境：
+
+```bash
+conda activate bussiness_final
+uvicorn app:app --reload
+```
+
 启动后访问 <http://127.0.0.1:8000>。
 
-首次提问时系统会自动准备数据：优先使用 `data/raw/` 的 Olist CSV；若缺失则尝试从公开 GitHub 镜像下载；若下载失败则生成 Olist-like 模拟数据，保证系统可运行。
+首次提问时系统会校验 `data/raw/` 的 9 张真实 Olist CSV；若缺失会尝试从公开 Olist CSV 镜像下载真实文件，下载失败或下载后仍缺失会直接报错，不会生成模拟数据。
 
 ## 命令行验收
 
@@ -42,7 +51,10 @@ uvicorn app:app --reload
 python cli.py --bootstrap "2017年各月GMV趋势？"
 python cli.py "哪些州配送延迟严重？"
 python cli.py "预测未来6期GMV。"
+python cli.py --validate-assignment
 ```
+
+`--validate-assignment` 会逐题调用真实大模型规划 SQL，批量检查任务书附录 10 个问题，不会使用本地写死 SQL 兜底。
 
 ## API Key
 
@@ -58,4 +70,4 @@ QWEN_MODEL=qwen3.6-plus
 
 ## 数据准备
 
-真实 Olist CSV 文件应放入 `data/raw/`。原始 CSV、SQLite 本地库和生成产物已在 `.gitignore` 中排除，避免提交大文件。MySQL 建表与预聚合刷新 SQL 位于 `sql/schema.sql` 与 `sql/materialized_views.sql`。
+真实 Olist CSV 文件应放入 `data/raw/`。原始 CSV、SQLite 本地库和生成产物已在 `.gitignore` 中排除，避免提交大文件。当前运行时暂用 SQLite，本地库由真实 CSV 重建；MySQL 建表与预聚合刷新 SQL 位于 `sql/schema.sql` 与 `sql/materialized_views.sql`，用于后续迁移。
