@@ -471,6 +471,16 @@ SUPPLEMENTAL_TASKS: dict[str, QueryTask] = {
         "SELECT product_category_name, total_reviews, avg_review_score, negative_reviews, negative_rate, delay_complaints, quality_complaints, wrong_item_complaints, service_complaints, other_complaints FROM mv_review_category_perf ORDER BY negative_reviews DESC, negative_rate DESC LIMIT 20",
         "Top差评品类及物流、质量、错发、客服和其他原因分类",
     ),
+    "review_topics": QueryTask(
+        "review_topics",
+        "SELECT topic_label, topic_keywords, complaint_count, topic_share FROM mv_review_topics WHERE product_category_name = 'ALL' ORDER BY complaint_count DESC LIMIT 12",
+        "平台级负面评论 NMF 主题（数据驱动的差评主因，topic_keywords 为葡语关键词）",
+    ),
+    "review_topics_by_category": QueryTask(
+        "review_topics_by_category",
+        "SELECT product_category_name, topic_label, topic_keywords, complaint_count, topic_share FROM mv_review_topics WHERE product_category_name <> 'ALL' ORDER BY complaint_count DESC LIMIT 30",
+        "高差评品类各自集中的 NMF 主题（取代关键词分类的'其他'黑洞）",
+    ),
     "seller_review": QueryTask(
         "seller_review",
         "SELECT seller_id, seller_state, SUM(total_orders) AS total_orders, ROUND(SUM(total_gmv), 2) AS total_gmv, ROUND(AVG(avg_review_score), 2) AS avg_review_score FROM mv_seller_perf GROUP BY seller_id, seller_state HAVING total_orders >= 3 ORDER BY avg_review_score ASC, total_orders DESC LIMIT 20",
@@ -571,7 +581,10 @@ def _append_tasks_for_view(tasks: tuple[QueryTask, ...], view: str, plan_context
     if view == "mv_category_sales":
         return _append_task(tasks, "category_sales")
     if view == "mv_review_category_perf":
-        return _append_task(tasks, "review_category")
+        tasks = _append_task(tasks, "review_category")
+        return _append_task(tasks, "review_topics_by_category")
+    if view == "mv_review_topics":
+        return _append_task(tasks, "review_topics_by_category")
     if view == "mv_seller_perf":
         return _append_task(tasks, "seller_review")
     if view == "mv_weight_freight":
@@ -596,7 +609,7 @@ def _supplement_tasks(question: str, tasks: tuple[QueryTask, ...], plan_context:
             tasks = _append_task(tasks, "monthly_sales")
             tasks = _append_task(tasks, "weekly_sales")
         if plan_context.get("analysis_type") == "prescriptive":
-            for key in ("monthly_sales", "state_sales", "delivery_by_state", "category_sales", "payment_summary", "review_category"):
+            for key in ("monthly_sales", "state_sales", "delivery_by_state", "category_sales", "payment_summary", "review_category", "review_topics"):
                 tasks = _append_task(tasks, key)
 
     text = question.lower()
@@ -606,7 +619,7 @@ def _supplement_tasks(question: str, tasks: tuple[QueryTask, ...], plan_context:
     if any(keyword in text for keyword in ("地图", "地理", "geo", "map", "巴西", "州级", "州分布")):
         tasks = _prepend_task(tasks, _geo_task_key(question, plan_context))
     if any(keyword in text for keyword in ("整体运营", "全部分析", "综合", "三大优先", "优先改进", "3个月", "三个月", "策略", "建议")):
-        for key in ("monthly_sales", "state_sales", "delivery_by_state", "category_sales", "payment_summary", "review_category"):
+        for key in ("monthly_sales", "state_sales", "delivery_by_state", "category_sales", "payment_summary", "review_category", "review_topics"):
             tasks = _append_task(tasks, key)
     if any(keyword in text for keyword in ("准时", "延迟", "配送", "交付", "delivery")):
         tasks = _append_task(tasks, "delivery_overall")
@@ -616,6 +629,7 @@ def _supplement_tasks(question: str, tasks: tuple[QueryTask, ...], plan_context:
         tasks = _append_task(tasks, "payment_heatmap")
     if any(keyword in text for keyword in ("差评", "评分", "评论", "review", "negative")):
         tasks = _append_task(tasks, "review_category")
+        tasks = _append_task(tasks, "review_topics_by_category")
     if any(keyword in text for keyword in ("卖家", "seller")):
         tasks = _append_task(tasks, "seller_review")
     if any(keyword in text for keyword in ("重量", "尺寸", "体积", "运费", "weight", "freight")):

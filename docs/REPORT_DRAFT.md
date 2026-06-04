@@ -33,15 +33,23 @@ flowchart LR
 
 ## 4. 数据预处理与预聚合
 
-系统启动或刷新时核验 9 张真实 Olist CSV，缺失则尝试从公开镜像下载真实 CSV。导入后建立基础表、索引和 10 张预聚合表：
+系统启动或刷新时核验 9 张真实 Olist CSV，缺失则尝试从公开镜像下载真实 CSV。导入后建立基础表、索引和 11 张预聚合表：
 
-`mv_monthly_sales`、`mv_state_sales`、`mv_category_sales`、`mv_delivery_perf`、`mv_seller_perf`、`mv_payment_dist`、`mv_weekly_sales`、`mv_state_geo`、`mv_review_category_perf`、`mv_weight_freight`。
+`mv_monthly_sales`、`mv_state_sales`、`mv_category_sales`、`mv_delivery_perf`、`mv_seller_perf`、`mv_payment_dist`、`mv_weekly_sales`、`mv_state_geo`、`mv_review_category_perf`、`mv_review_topics`、`mv_weight_freight`。
 
 DataAnalyst 的提示词注入基础表和预聚合表数据字典，要求大模型优先生成命中 `mv_*` 的只读 SQL。代码层定位为大模型的"安全护栏 + 确定性证据模板"：
 
 - 业务 SQL 规划与查询结果的自然语言直答均由大模型实时完成，代码不再用写死 if-else 拼装答案；
 - 仅保留一组确定性的 `mv_*` 证据查询模板（如地图所需的州级经纬度 JOIN、预测所需的周 GMV 序列），用于保证地图/预测这类机械取数稳定可复现——这类查询用大模型每次重写反而易引入偏差；
 - 所有 SQL 经过只读校验、危险语句拦截和 SQLite 方言规整后才执行，非法或缺数据时明确报错。
+
+### 4.1 负面评论主题建模（加分项：NLP 情感/主题分析融入决策）
+
+原 `mv_review_category_perf` 用葡萄牙语关键词 LIKE 把差评粗分为物流/质量/错发/客服/其他，由于约六成评论无文本、且大量措辞不命中关键词，**超 70% 差评落入"其他"黑洞**，无法支撑经营决策。
+
+为此引入 `utils/review_topics.py`：在 ETL 阶段对 `review_score<=2` 的葡语评论文本做 **TF-IDF + NMF 无监督主题建模**（scikit-learn），自动学习数据驱动的差评主题，按品类聚合落地为 `mv_review_topics`（含 `topic_label`、`topic_keywords`、`complaint_count`、`topic_share`，并含 `ALL` 平台级行）。模型本地训练秒级、无需下载预训练模型，运行时只查预聚合结果、零额外负担。
+
+实测主题揭示了关键词分类完全遗漏的真实根因——如"付款后未收到货 / 漏发缺件"（`comprei dois · recebi apenas`）与"下单后物流拖延"（`compra · pedido · dia`）。DataAnalyst 将该结果作为证据，DecisionMaker 据此输出针对履约漏发、物流提速的具体改进建议，完成"NLP 分析→决策建议"的闭环。
 
 ## 5. 可视化覆盖
 

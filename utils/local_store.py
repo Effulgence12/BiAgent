@@ -16,6 +16,7 @@ from time import perf_counter
 
 from config.settings import settings
 from utils.data_bootstrap import ensure_dataset
+from utils.review_topics import build_review_topic_table
 
 CSV_TABLES = {
     "olist_customers_dataset.csv": "customers",
@@ -39,6 +40,7 @@ MATERIALIZED_VIEW_NAMES = (
     "mv_weekly_sales",
     "mv_state_geo",
     "mv_review_category_perf",
+    "mv_review_topics",
     "mv_weight_freight",
 )
 
@@ -327,6 +329,9 @@ def refresh_materialized_views(conn: sqlite3.Connection) -> None:
         CREATE INDEX idx_mv_weight_freight_bucket_status ON mv_weight_freight(weight_bucket, delivery_status);
         """
     )
+
+    # 负面评论主题建模（TF-IDF + NMF）：用 Python 在基础表上训练，产出 mv_review_topics。
+    build_review_topic_table(conn)
 
 
 def bootstrap_local_store(force: bool = False, data_dir: Path | None = None, db_path: Path | None = None) -> str:

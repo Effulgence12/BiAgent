@@ -488,6 +488,68 @@ def test_prediction_question_adds_monthly_and_weekly_evidence(monkeypatch):
     assert "monthly_sales" in analysis.results
     assert any({"week_start", "total_gmv"}.issubset(result.columns) for result in analysis.results.values())
 
+
+def _seed_review_tables(conn, corpus):
+    """建立 NMF 主题建模所需的最小基础表，并写入合成负面评论。"""
+    conn.executescript(
+        """
+        CREATE TABLE order_reviews (review_id TEXT, order_id TEXT, review_score TEXT, review_comment_message TEXT);
+        CREATE TABLE orders (order_id TEXT);
+        CREATE TABLE order_items (order_id TEXT, product_id TEXT, seller_id TEXT);
+        CREATE TABLE products (product_id TEXT, product_category_name TEXT);
+        CREATE TABLE product_category_name_translation (product_category_name TEXT, product_category_name_english TEXT);
+        """
+    )
+    for index, (category, message) in enumerate(corpus):
+        oid = f"o{index}"
+        pid = f"p_{category}"
+        conn.execute("INSERT INTO order_reviews VALUES (?,?,?,?)", (f"r{index}", oid, "1", message))
+        conn.execute("INSERT INTO orders VALUES (?)", (oid,))
+        conn.execute("INSERT INTO order_items VALUES (?,?,?)", (oid, pid, "s0"))
+    for category in {category for category, _ in corpus}:
+        conn.execute("INSERT INTO products VALUES (?,?)", (f"p_{category}", category))
+        conn.execute("INSERT INTO product_category_name_translation VALUES (?,?)", (category, category))
+
+
+def test_review_topics_nmf_populates_table():
+    import sqlite3
+
+    from utils import review_topics
+
+    clusters = {
+        "atrasados": "atraso entrega demorou chegar prazo",
+        "defeito": "produto quebrado defeito ruim qualidade",
+        "errado": "recebi errado diferente trocar item",
+    }
+    corpus = [(category, text) for category, text in clusters.items() for _ in range(20)]
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    _seed_review_tables(conn, corpus)
+    review_topics.build_review_topic_table(conn)
+    rows = conn.execute("SELECT product_category_name, topic_id, complaint_count, topic_share FROM mv_review_topics").fetchall()
+    assert rows, "NMF 主题表应被填充"
+    all_total = conn.execute("SELECT SUM(complaint_count) FROM mv_review_topics WHERE product_category_name='ALL'").fetchone()[0]
+    assert all_total == 60  # 平台级按唯一评论计数
+    assert all(0.0 <= row["topic_share"] <= 1.0 for row in rows)
+    conn.close()
+
+
+def test_review_topics_handles_sparse_data():
+    import sqlite3
+
+    from utils import review_topics
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    _seed_review_tables(conn, [("x", "atraso entrega")] * 5)
+    review_topics.build_review_topic_table(conn)
+    # 样本不足时建立空表但列契约不变，不阻断 ETL。
+    columns = [c[1] for c in conn.execute("PRAGMA table_info(mv_review_topics)").fetchall()]
+    assert columns == list(review_topics.REVIEW_TOPICS_COLUMNS)
+    assert conn.execute("SELECT COUNT(*) FROM mv_review_topics").fetchone()[0] == 0
+    conn.close()
+
+
 import utils.llm_client as llm_client
 import app as app_module
 import cli as cli_module

@@ -57,6 +57,18 @@ MATERIALIZED_VIEWS = {
             "other_complaints",
         ],
     },
+    "mv_review_topics": {
+        "grain": "product_category_name + topic_id ('ALL' 行为平台级)",
+        "purpose": "负面评论 TF-IDF+NMF 主题建模结果：每个品类的差评集中在哪些数据驱动主题（topic_label/topic_keywords 为葡语关键词），用于回答差评原因并支撑改进建议；优于关键词分类。",
+        "columns": [
+            "product_category_name",
+            "topic_id",
+            "topic_label",
+            "topic_keywords",
+            "complaint_count",
+            "topic_share",
+        ],
+    },
     "mv_weight_freight": {
         "grain": "weight_bucket + delivery_status",
         "purpose": "Product weight/volume versus freight relationship for bubble scatter charts.",

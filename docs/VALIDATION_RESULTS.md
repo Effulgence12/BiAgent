@@ -53,6 +53,14 @@ python cli.py --validate-general
 - `SUPPLEMENTAL_TASKS` 证据视图模板（地图/预测/各维度 `mv_*` 取数）作为合理的少量确定性逻辑保留，仅负责机械取数与可视化证据补充，不参与答案文本生成。
 - 离线单元验收：`python -m pytest -q tests/test_skeleton.py` 全部 32 项通过（新增 `synthesize_direct_answer` 接地上下文与确定性兜底两项测试，移除 3 项过时的写死直答断言）。
 
+## 2026-06-04 负面评论 NMF 主题建模（加分项）
+
+- 新增 `utils/review_topics.py`：对 `review_score<=2` 的葡语评论做 TF-IDF + NMF 无监督主题建模（scikit-learn 1.5.2），按品类聚合落地为 `mv_review_topics`，已注册进数据字典供 LLM 规划命中。
+- 解决 `mv_review_category_perf` 关键词分类把超 70% 差评归入"其他"的问题：NMF 揭示真实根因为"付款后未收到货/漏发"（`comprei dois · recebi apenas`）与"下单后物流拖延"（`compra · pedido · dia`）等。
+- 真实单题验收：`python cli.py "Top10差评品类及其主要差评原因是什么？"`，Planner 自动关联 `mv_review_topics`（treemap + `topic_share`），直答与 DecisionMaker 三条建议均围绕 NMF 主题给出履约漏发、物流提速的具体动作，完成"NLP 分析→决策建议"闭环。
+- 性能：模型在 ETL/刷新阶段本地训练（秒级，无预训练模型下载），运行时只查预聚合结果，零额外负担。
+- 离线单元验收：`python -m pytest -q tests/test_skeleton.py` 全部 34 项通过（新增 NMF 主题表填充与稀疏样本兜底两项测试）。
+
 ## 泛化验收
 
 2026-05-12 新增非附录泛化验收入口：
