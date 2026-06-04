@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Agentic BI - Olist 运营分析系统</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">Olist Agentic BI</p>
+        <h1>多 Agent 运营分析工作台</h1>
+      </div>
+      <div class="session-card">
+        <span>会话</span>
+        <strong id="session-id">初始化中</strong>
+        <small id="memory-count">记忆 0 轮</small>
+      </div>
+    </header>
+
+    <main class="layout">
+      <section class="panel chat-panel" aria-label="对话区">
+        <div class="panel-heading">
+          <h2>对话区</h2>
+          <span id="connection-state" class="state-pill idle">就绪</span>
+        </div>
+        <div id="messages" class="messages">
+          <article class="message assistant">
+            请输入一个 Olist 运营问题，例如：2017年各月GMV趋势？哪些州配送延迟严重？预测未来6期GMV。
+          </article>
+        </div>
+        <form id="question-form" class="composer">
+          <input id="question" name="question" placeholder="输入业务问题，支持追问刚才的州、品类或趋势..." required />
+          <button type="submit">发送</button>
+        </form>
+        <button id="bootstrap" class="secondary" type="button">初始化/刷新本地数据</button>
+      </section>
+
+      <section class="panel result-panel" aria-label="分析结果">
+        <div class="panel-heading">
+          <h2>分析结果</h2>
+          <span id="stage-label" class="state-pill idle">等待问题</span>
+        </div>
+        <div class="tabs" role="tablist">
+          <button class="tab active" data-target="overview" type="button">总览</button>
+          <button class="tab" data-target="chart" type="button">图表</button>
+          <button class="tab" data-target="sql" type="button">SQL</button>
+          <button class="tab" data-target="agent" type="button">Agent</button>
+          <button class="tab" data-target="advice" type="button">建议</button>
+          <button class="tab" data-target="raw" type="button">JSON</button>
+        </div>
+
+        <section id="overview" class="tab-panel active">
+          <div id="kpis" class="kpi-grid"></div>
+          <div class="surface">
+            <h3>结论摘要</h3>
+            <p id="direct-answer">等待分析请求...</p>
+            <p id="summary-text" class="muted">真实 SQL 查询完成后会展示数据摘要。</p>
+          </div>
+        </section>
+
+        <section id="chart" class="tab-panel">
+          <div class="chart-toolbar">
+            <div>
+              <h3 id="chart-title">图表工作区</h3>
+              <p id="chart-source" class="muted">等待可视化 Agent 输出。</p>
+            </div>
+            <div class="chart-actions">
+              <button id="download-chart" class="secondary compact" type="button" disabled>下载 HTML</button>
+              <button id="download-image" class="secondary compact" type="button" disabled>下载图片</button>
+            </div>
+          </div>
+          <div class="chart-shell">
+            <nav id="chart-list" class="chart-list" aria-label="图表列表"></nav>
+            <div id="chart-stage" class="chart-stage">等待分析请求...</div>
+          </div>
+        </section>
+
+        <section id="sql" class="tab-panel">
+          <pre id="sql-output">等待 SQL 规划...</pre>
+        </section>
+
+        <section id="agent" class="tab-panel">
+          <ol id="agent-events" class="agent-events"></ol>
+        </section>
+
+        <section id="advice" class="tab-panel">
+          <div class="surface">
+            <h3>决策建议</h3>
+            <div id="advice-stream" class="advice-stream">等待真实大模型流式输出...</div>
+          </div>
+          <div id="forecast-json" class="surface forecast-block"></div>
+        </section>
+
+        <section id="raw" class="tab-panel">
+          <pre id="raw-output">[]</pre>
+        </section>
+      </section>
+    </main>
+    <script src="/static/app.js?v=final-sprint-20260512-1"></script>
+  </body>
+</html>
