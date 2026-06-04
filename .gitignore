@@ -15,3 +15,5 @@ reports/screenshots/
 models/cache/
 *.sqlite
 *.db
+
+screenshots/

@@ -15,6 +15,29 @@ from utils.data_bootstrap import DatasetValidationError, ensure_dataset, has_req
 from utils.local_store import QueryResult, bootstrap_local_store
 from utils.query_router import decide_query_route, referenced_relations
 from utils.query_router import QueryRoute
+from utils.llm_client import LLMClientError, LLMResponse
+
+
+def _planner_response(
+    analysis_type: str = "descriptive",
+    required_views: list[str] | None = None,
+    metrics: list[str] | None = None,
+    chart_requirements: list[dict[str, object]] | None = None,
+) -> LLMResponse:
+    payload = {
+        "analysis_type": analysis_type,
+        "intent": "test intent",
+        "metrics": metrics or ["total_gmv"],
+        "dimensions": ["customer_state"],
+        "filters": {},
+        "required_agents": ["orchestrator", "data_analyst", "visualizer", "decision_maker"],
+        "required_views": required_views or ["mv_monthly_sales"],
+        "chart_requirements": chart_requirements or [{"chart_type": "line", "metric": "total_gmv", "dimension": "year_month", "source_view": "mv_monthly_sales"}],
+        "followup_reference": "",
+        "confidence": 0.9,
+        "reasoning_summary": "planner test",
+    }
+    return LLMResponse(content=json.dumps(payload, ensure_ascii=False), used_api=True, model="test")
 
 
 def _write_csv(path: Path, rows: list[dict[str, object]]) -> None:
@@ -80,6 +103,39 @@ def test_sql_normalizer_wraps_ordered_union_all_inside_cte():
     assert "UNION ALL SELECT * FROM" in normalized
 
 
+def test_llm_sql_task_with_multiple_selects_is_split(monkeypatch):
+    payload = {
+        "tasks": [
+            {
+                "name": "mixed_evidence",
+                "purpose": "多视图证据",
+                "sql": "SELECT customer_state, total_gmv FROM mv_state_geo ORDER BY total_gmv DESC LIMIT 5; SELECT customer_state, late_rate FROM mv_delivery_perf ORDER BY late_rate DESC LIMIT 5;",
+            }
+        ]
+    }
+    monkeypatch.setattr(data_analyst, "chat_completion", lambda *args, **kwargs: LLMResponse(content=json.dumps(payload), used_api=True, model="test"))
+    tasks = data_analyst.plan_tasks_with_llm("对比销售和配送风险")
+    assert len(tasks) == 2
+    assert tasks[0].name == "mixed_evidence_1"
+    assert tasks[1].name == "mixed_evidence_2"
+    assert all(";" not in task.sql for task in tasks)
+
+
+def test_sql_normalizer_rewrites_percentile_cont_for_sqlite():
+    sql = (
+        "WITH seller_stats AS ("
+        "SELECT seller_id, total_orders, "
+        "(SELECT PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY total_orders) "
+        "FROM mv_seller_perf WHERE year_month = '2018-01') AS p75_orders "
+        "FROM mv_seller_perf WHERE year_month = '2018-01') "
+        "SELECT seller_id FROM seller_stats WHERE total_orders > p75_orders"
+    )
+    normalized = data_analyst._validate_sql(sql)
+    assert "PERCENTILE_CONT" not in normalized.upper()
+    assert "WITHIN GROUP" not in normalized.upper()
+    assert "LIMIT 1 OFFSET" in normalized
+
+
 def test_data_analyst_payment_question_hits_payment_view(monkeypatch):
     payload = {
         "tasks": [
@@ -114,7 +170,70 @@ def test_direct_answer_sorts_state_rows_by_metric():
     assert "最低的是 MG" in answer
 
 
-def test_plan_and_forecast_placeholders():
+def test_direct_answer_prioritizes_payment_focus_over_supplemental_state_rows():
+    payment = QueryResult(
+        columns=["payment_type", "payment_count", "avg_installments"],
+        rows=[{"payment_type": "credit_card", "payment_count": 10, "avg_installments": 3.2}],
+        elapsed_ms=1.0,
+        row_count=1,
+        source="test",
+    )
+    state = QueryResult(
+        columns=["customer_state", "total_gmv", "total_orders"],
+        rows=[{"customer_state": "SP", "total_gmv": 1000, "total_orders": 5}],
+        elapsed_ms=1.0,
+        row_count=1,
+        source="test",
+    )
+    answer = data_analyst.build_direct_answer_from_results("不同支付方式和分期数的订单分布热力图应该怎么看？", {"payment_summary": payment, "state_sales": state})
+    assert "支付分布" in answer
+    assert "销售额最高的州" not in answer
+
+
+def test_direct_answer_prioritizes_review_focus_over_delivery_rows():
+    review = QueryResult(
+        columns=["product_category_name", "negative_rate", "negative_reviews", "delay_complaints", "quality_complaints"],
+        rows=[{"product_category_name": "bed_bath_table", "negative_rate": 0.2, "negative_reviews": 30, "delay_complaints": 8, "quality_complaints": 12}],
+        elapsed_ms=1.0,
+        row_count=1,
+        source="test",
+    )
+    delivery = QueryResult(
+        columns=["customer_state", "late_rate", "late_orders"],
+        rows=[{"customer_state": "AL", "late_rate": 0.24, "late_orders": 95}],
+        elapsed_ms=1.0,
+        row_count=1,
+        source="test",
+    )
+    answer = data_analyst.build_direct_answer_from_results("请分析消费者低分反馈背后是配送还是商品问题。", {"review_category": review, "delivery_by_state": delivery})
+    assert "差评风险最高品类" in answer
+    assert "物流延迟投诉" in answer
+
+
+def test_primary_task_selection_follows_question_focus():
+    tasks = (
+        QueryTask("state_geo_map", "SELECT * FROM mv_state_geo LIMIT 1", "地图"),
+        QueryTask("payment_summary", "SELECT * FROM mv_payment_dist LIMIT 1", "支付"),
+    )
+    results = {
+        "state_geo_map": QueryResult(["customer_state"], [{"customer_state": "SP"}], 1.0, 1, "test"),
+        "payment_summary": QueryResult(["payment_type"], [{"payment_type": "credit_card"}], 1.0, 1, "test"),
+    }
+    primary = data_analyst._select_primary_task("不同支付方式和分期数的订单分布热力图应该怎么看？", tasks, results)
+    assert primary.name == "payment_summary"
+
+
+def test_plan_and_forecast_placeholders(monkeypatch):
+    monkeypatch.setattr(
+        orchestrator,
+        "chat_completion",
+        lambda *args, **kwargs: _planner_response(
+            analysis_type="predictive",
+            required_views=["mv_monthly_sales", "mv_weekly_sales"],
+            metrics=["forecast_gmv"],
+            chart_requirements=[{"chart_type": "line", "metric": "forecast_gmv", "dimension": "week_start", "source_view": "mv_weekly_sales"}],
+        ),
+    )
     plan = build_plan("预测未来6周GMV")
     assert plan.analysis_type == "predictive"
     assert naive_forecast([1, 2, 3], periods=3) == [3.0, 3.0, 3.0]
@@ -163,13 +282,55 @@ def test_workflow_returns_chart_and_recommendations(monkeypatch):
         summary="测试摘要",
         direct_answer="测试直接回答",
     )
-    monkeypatch.setattr(orchestrator, "analyze_question", lambda question: data_analysis)
+    monkeypatch.setattr(orchestrator, "analyze_question", lambda question, plan_context=None: data_analysis)
+    monkeypatch.setattr(
+        orchestrator,
+        "build_plan",
+        lambda question: AnalysisPlan(
+            "diagnostic",
+            ("Orchestrator", "DataAnalyst", "Visualizer", "DecisionMaker"),
+            intent=question,
+            required_agents=("orchestrator", "data_analyst", "visualizer", "decision_maker"),
+            required_views=("mv_delivery_perf",),
+        ),
+    )
     monkeypatch.setattr(orchestrator, "build_recommendations", lambda *args, **kwargs: ["真实 LLM 建议占位"])
     workflow = run_workflow("哪些州配送延迟严重？")
     assert workflow.plan.analysis_type == "diagnostic"
     assert workflow.data_analysis.result.rows
     assert "<" in workflow.chart_html
     assert workflow.recommendations
+
+
+def test_forecast_node_uses_valid_weekly_result_not_empty_first_result():
+    empty_weekly = QueryResult(
+        columns=["week_start", "total_gmv"],
+        rows=[],
+        elapsed_ms=1.0,
+        row_count=0,
+        source="test",
+    )
+    valid_weekly = QueryResult(
+        columns=["week_start", "total_gmv"],
+        rows=[{"week_start": f"2018-0{1 + index // 4}-{1 + (index % 4) * 7:02d}", "total_gmv": 1000 + index * 50} for index in range(8)],
+        elapsed_ms=1.0,
+        row_count=8,
+        source="test",
+    )
+    data_analysis = DataAnalysis(
+        question="预测未来6周GMV",
+        sql="SELECT week_start, total_gmv FROM mv_weekly_sales LIMIT 8",
+        tasks=(),
+        route=QueryRoute("materialized_view", ("mv_weekly_sales",), "test"),
+        routes={},
+        result=empty_weekly,
+        results={"empty_weekly": empty_weekly, "weekly_sales": valid_weekly},
+        summary="test",
+        direct_answer="test",
+    )
+    state = orchestrator._forecast_node({"data_analysis": data_analysis})
+    assert state["forecast"]
+    assert state["forecast_diagnostics"]["point_count"] == 8
 
 
 def test_render_chart_html_table_fallback():
@@ -193,6 +354,105 @@ def test_render_charts_returns_structured_plotly_specs():
     assert "data-table" in charts[0]["html"]
 
 
+def test_folium_map_renders_as_iframe_not_notebook_placeholder():
+    result = QueryResult(
+        columns=["customer_state", "lat", "lng", "total_orders", "total_gmv", "avg_order_value"],
+        rows=[{"customer_state": "SP", "lat": -23.5, "lng": -46.6, "total_orders": 10, "total_gmv": 100.0, "avg_order_value": 10.0}],
+        elapsed_ms=1.0,
+        row_count=1,
+        source="mv_state_geo",
+    )
+    charts = render_charts({"state_geo_map": result}, [])
+    assert charts[0]["type"] == "folium_map_sales"
+    assert "folium-frame" in charts[0]["html"]
+    assert "Make this Notebook Trusted" not in charts[0]["html"]
+
+
+def test_delivery_map_task_is_prioritized_for_delay_map_questions():
+    tasks = data_analyst._supplement_tasks("地图中显示延迟配送最严重的州", ())
+    assert tasks[0].name == "delivery_geo_map"
+    assert "mv_state_geo" in tasks[0].sql
+    assert "mv_delivery_perf" in tasks[0].sql
+
+
+def test_delivery_geo_result_renders_delay_map():
+    result = QueryResult(
+        columns=["customer_state", "lat", "lng", "total_orders", "late_orders", "late_rate", "avg_delivery_days", "map_metric"],
+        rows=[
+            {"customer_state": "AL", "lat": -9.59, "lng": -36.05, "total_orders": 397, "late_orders": 95, "late_rate": 0.2393, "avg_delivery_days": 17.2, "map_metric": "delivery_late"},
+            {"customer_state": "SP", "lat": -23.15, "lng": -47.08, "total_orders": 40501, "late_orders": 2385, "late_rate": 0.0589, "avg_delivery_days": 10.4, "map_metric": "delivery_late"},
+        ],
+        elapsed_ms=1.0,
+        row_count=2,
+        source="mv_state_geo + mv_delivery_perf",
+    )
+    charts = render_charts({"delivery_geo_map": result}, [])
+    assert charts[0]["title"] == "各州配送延迟地图"
+    assert charts[0]["type"] == "folium_map_delivery_late"
+    assert "延迟率" in charts[0]["html"]
+    assert "GMV:" not in charts[0]["html"]
+
+
+def test_orchestrator_llm_planner_parses_structured_plan(monkeypatch):
+    monkeypatch.setattr(
+        orchestrator,
+        "chat_completion",
+        lambda *args, **kwargs: _planner_response(
+            analysis_type="diagnostic",
+            required_views=["mv_state_geo", "mv_delivery_perf"],
+            metrics=["delivery_late_rate"],
+            chart_requirements=[{"chart_type": "folium_map", "metric": "delivery_late_rate", "dimension": "customer_state", "source_view": "mv_state_geo + mv_delivery_perf"}],
+        ),
+    )
+    plan = orchestrator.build_plan("请用地图找出物流风险热区，不要只看销售额。")
+    assert plan.analysis_type == "diagnostic"
+    assert "mv_state_geo" in plan.required_views
+    assert "delivery_late_rate" in plan.metrics
+    assert plan.chart_requirements[0]["metric"] == "delivery_late_rate"
+
+
+def test_orchestrator_planner_invalid_json_fails_loudly(monkeypatch):
+    monkeypatch.setattr(orchestrator, "chat_completion", lambda *args, **kwargs: LLMResponse(content="not json", used_api=True, model="test"))
+    try:
+        orchestrator.build_plan("随便问一个问题")
+    except ValueError as exc:
+        assert "Orchestrator Planner" in str(exc)
+    else:
+        raise AssertionError("invalid planner JSON must fail loudly")
+
+
+def test_planner_metric_controls_geo_supplement_without_question_keyword():
+    plan_context = {
+        "analysis_type": "diagnostic",
+        "metrics": ["delivery_late_rate"],
+        "required_views": ["mv_state_geo", "mv_delivery_perf"],
+        "chart_requirements": [{"chart_type": "folium_map", "metric": "delivery_late_rate", "source_view": "mv_state_geo + mv_delivery_perf"}],
+    }
+    tasks = data_analyst._supplement_tasks("请找出物流风险热区", (), plan_context)
+    assert tasks[0].name == "delivery_geo_map"
+    assert any(task.name == "delivery_by_state" for task in tasks)
+
+
+def test_visualizer_uses_planner_chart_metric_for_on_time_map():
+    result = QueryResult(
+        columns=["customer_state", "lat", "lng", "total_orders", "late_orders", "late_rate", "on_time_rate", "avg_delivery_days"],
+        rows=[
+            {"customer_state": "AL", "lat": -9.59, "lng": -36.05, "total_orders": 397, "late_orders": 95, "late_rate": 0.2393, "on_time_rate": 0.7607, "avg_delivery_days": 17.2},
+            {"customer_state": "SP", "lat": -23.15, "lng": -47.08, "total_orders": 40501, "late_orders": 2385, "late_rate": 0.0589, "on_time_rate": 0.9411, "avg_delivery_days": 10.4},
+        ],
+        elapsed_ms=1.0,
+        row_count=2,
+        source="mv_state_geo + mv_delivery_perf",
+    )
+    charts = render_charts(
+        {"on_time_geo_map": result},
+        [],
+        chart_requirements=[{"chart_type": "folium_map", "metric": "delivery_on_time_rate", "source_view": "mv_state_geo + mv_delivery_perf"}],
+    )
+    assert charts[0]["type"] == "folium_map_delivery_on_time"
+    assert "GMV:" not in charts[0]["html"]
+
+
 def test_map_question_adds_geo_supplement(monkeypatch):
     state_result = QueryResult(
         columns=["customer_state", "total_gmv"],
@@ -211,7 +471,7 @@ def test_map_question_adds_geo_supplement(monkeypatch):
     monkeypatch.setattr(
         data_analyst,
         "draft_tasks",
-        lambda question: (QueryTask("state_sales", "SELECT customer_state,total_gmv FROM mv_state_sales LIMIT 10", "州销售"),),
+        lambda question, plan_context=None: (QueryTask("state_sales", "SELECT customer_state,total_gmv FROM mv_state_sales LIMIT 10", "州销售"),),
     )
     monkeypatch.setattr(data_analyst, "run_query", lambda sql: geo_result if "mv_state_geo" in sql else state_result)
     monkeypatch.setattr(data_analyst, "decide_query_route", lambda sql: QueryRoute("materialized_view", ("mv_state_geo" if "mv_state_geo" in sql else "mv_state_sales",), "test"))
@@ -238,7 +498,7 @@ def test_prediction_question_adds_monthly_and_weekly_evidence(monkeypatch):
     monkeypatch.setattr(
         data_analyst,
         "draft_tasks",
-        lambda question: (QueryTask("llm_weekly", "SELECT week_start,total_gmv FROM mv_weekly_sales LIMIT 20", "周GMV"),),
+        lambda question, plan_context=None: (QueryTask("llm_weekly", "SELECT week_start,total_gmv FROM mv_weekly_sales LIMIT 20", "周GMV"),),
     )
     monkeypatch.setattr(data_analyst, "run_query", lambda sql: monthly_result if "mv_monthly_sales" in sql else weekly_result)
     monkeypatch.setattr(data_analyst, "decide_query_route", lambda sql: QueryRoute("materialized_view", ("mv_monthly_sales" if "mv_monthly_sales" in sql else "mv_weekly_sales",), "test"))
@@ -308,7 +568,7 @@ def test_websocket_emits_structured_agent_events(monkeypatch):
         forecast_diagnostics={},
     )
     monkeypatch.setattr(app_module, "build_plan", lambda question: workflow.plan)
-    monkeypatch.setattr(app_module, "run_workflow", lambda question, generate_recommendations=False: workflow)
+    monkeypatch.setattr(app_module, "run_workflow", lambda question, generate_recommendations=False, initial_plan=None: workflow)
     monkeypatch.setattr(
         app_module,
         "stream_chat_completion",
@@ -389,7 +649,7 @@ def test_websocket_failed_turn_records_original_question(monkeypatch):
 
     monkeypatch.setattr(app_module, "build_plan", lambda question: plan)
 
-    def fail_workflow(question, generate_recommendations=False):
+    def fail_workflow(question, generate_recommendations=False, initial_plan=None):
         raise ValueError("SQL任务 best_worst_states 执行失败：ORDER BY clause should come after UNION ALL")
 
     monkeypatch.setattr(app_module, "run_workflow", fail_workflow)
@@ -407,3 +667,21 @@ def test_websocket_failed_turn_records_original_question(monkeypatch):
     assert error_event["request_id"]
     assert app_module.SESSIONS[session_id][-1]["failed_turn"] is True
     assert "ORDER BY" in app_module.SESSIONS[session_id][-1]["error"]
+
+
+def test_context_is_only_injected_for_followups():
+    session_id = f"context_session_{uuid.uuid4().hex}"
+    app_module.SESSIONS[session_id] = [
+        {
+            "question": "请用地图展示各州销售额。",
+            "direct_answer": "SP最高",
+            "summary": "地图摘要",
+            "matched_views": ["mv_state_geo"],
+            "sql_tasks": [{"name": "state_geo_map", "purpose": "地图", "sql": "SELECT * FROM mv_state_geo"}],
+        }
+    ]
+    independent = app_module._contextual_question(session_id, "不同支付方式和分期数的订单分布热力图应该怎么看？")
+    followup = app_module._contextual_question(session_id, "继续分析刚才图表中最需要关注的区域。")
+    assert independent == "不同支付方式和分期数的订单分布热力图应该怎么看？"
+    assert "最近对话上下文" in followup
+    assert "请用地图展示各州销售额" in followup

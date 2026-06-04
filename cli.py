@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 
 from agents.orchestrator import run_workflow
 from utils.local_store import bootstrap_local_store, table_counts
@@ -61,6 +62,14 @@ GENERAL_VALIDATION_CASES = [
     {"question": "请比较订单量最高州和最低州的销售表现。", "expected_any_views": ("mv_state_sales", "mv_state_geo")},
     {"question": "对刚才地图里表现最差的州继续分析配送原因。", "expected_any_views": ("mv_delivery_perf", "mv_state_geo"), "followup": True},
     {"question": "请继续分析该品类为什么评分偏低。", "expected_any_views": ("mv_review_category_perf", "mv_category_sales"), "followup": True},
+    {"question": "请用地图找出物流风险热区，不要只看销售额。", "expected_any_views": ("mv_state_geo", "mv_delivery_perf")},
+    {"question": "哪些区域的履约最拖后腿？请可视化展示。", "expected_any_views": ("mv_state_geo", "mv_delivery_perf")},
+    {"question": "请在州级地图上标出服务体验最薄弱的地区。", "expected_any_views": ("mv_state_geo", "mv_review_category_perf")},
+    {"question": "哪些州的卖家质量风险更值得关注？用地图表达。", "expected_any_views": ("mv_state_geo", "mv_seller_perf")},
+    {"question": "用地理图看看准时服务哪些地方最需要补课。", "expected_any_views": ("mv_state_geo", "mv_delivery_perf")},
+    {"question": "未来六周的平台收入是上行还是下行？给出区间。", "expected_any_views": ("mv_weekly_sales", "mv_monthly_sales"), "requires_forecast": True},
+    {"question": "哪些产品组的运力成本更可能压缩利润？", "expected_any_views": ("mv_weight_freight",)},
+    {"question": "请分析消费者低分反馈背后是配送还是商品问题。", "expected_any_views": ("mv_review_category_perf", "mv_delivery_perf")},
 ]
 
 
@@ -102,6 +111,11 @@ def _workflow_payload(question: str) -> dict[str, object]:
         "required_agents": list(workflow.plan.required_agents),
         "required_views": list(workflow.plan.required_views),
         "followup_reference": workflow.plan.followup_reference,
+        "metrics": list(workflow.plan.metrics),
+        "dimensions": list(workflow.plan.dimensions),
+        "chart_requirements": list(workflow.plan.chart_requirements),
+        "planner_confidence": workflow.plan.confidence,
+        "planner_reasoning_summary": workflow.plan.reasoning_summary,
         "matched_views": matched_views,
         "sql_task_count": len(workflow.data_analysis.tasks),
         "chart_count": len(workflow.charts),
@@ -128,11 +142,16 @@ def run_assignment_validation() -> list[dict[str, object]]:
     return results
 
 
-def run_general_validation() -> dict[str, object]:
+def run_general_validation(limit: int | None = None, offset: int = 0, progress: bool = False) -> dict[str, object]:
     """Run non-appendix questions to check generalization beyond the required 10."""
     results = []
-    for case in GENERAL_VALIDATION_CASES:
+    selected_cases = GENERAL_VALIDATION_CASES[offset:]
+    if limit is not None:
+        selected_cases = selected_cases[:limit]
+    for index, case in enumerate(selected_cases, start=offset + 1):
         question = str(case["question"])
+        if progress:
+            print(f"[validate-general] {index}/{len(GENERAL_VALIDATION_CASES)} {question}", file=sys.stderr, flush=True)
         payload = _workflow_payload(question)
         expected_views = tuple(case.get("expected_any_views") or ())
         payload["expected_any_views"] = list(expected_views)
@@ -150,6 +169,9 @@ def run_general_validation() -> dict[str, object]:
     pass_rate = passed_count / len(results) if results else 0
     return {
         "total": len(results),
+        "case_total": len(GENERAL_VALIDATION_CASES),
+        "offset": offset,
+        "limit": limit,
         "passed_count": passed_count,
         "pass_rate": round(pass_rate, 4),
         "target_pass_rate": 0.9,
@@ -164,6 +186,9 @@ def main() -> None:
     parser.add_argument("--bootstrap", action="store_true", help="Force rebuild the local SQLite analytics store before analysis")
     parser.add_argument("--validate-assignment", action="store_true", help="Run the 10 assignment appendix questions without local fallbacks")
     parser.add_argument("--validate-general", action="store_true", help="Run 25+ non-appendix questions to validate generalization")
+    parser.add_argument("--general-offset", type=int, default=0, help="Start offset for --validate-general, useful for chunked real-model checks")
+    parser.add_argument("--general-limit", type=int, help="Maximum number of --validate-general cases to run")
+    parser.add_argument("--validation-progress", action="store_true", help="Print validation progress to stderr while running")
     parser.add_argument("--no-recommendations", action="store_true", help="Skip the DecisionMaker LLM recommendation step")
     args = parser.parse_args()
 
@@ -179,7 +204,7 @@ def main() -> None:
         return
 
     if args.validate_general:
-        report = run_general_validation()
+        report = run_general_validation(limit=args.general_limit, offset=args.general_offset, progress=args.validation_progress)
         print(json.dumps(report, ensure_ascii=False, indent=2))
         if not report.get("passed"):
             raise SystemExit(1)
@@ -191,6 +216,11 @@ def main() -> None:
         "intent": workflow.plan.intent,
         "required_agents": workflow.plan.required_agents,
         "required_views": workflow.plan.required_views,
+        "metrics": workflow.plan.metrics,
+        "dimensions": workflow.plan.dimensions,
+        "chart_requirements": workflow.plan.chart_requirements,
+        "planner_confidence": workflow.plan.confidence,
+        "planner_reasoning_summary": workflow.plan.reasoning_summary,
         "steps": workflow.plan.steps,
         "sql": workflow.data_analysis.sql,
         "route": workflow.data_analysis.route.route,

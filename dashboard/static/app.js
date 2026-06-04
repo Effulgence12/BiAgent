@@ -165,6 +165,22 @@ function renderKpis(state) {
 }
 
 function agentDetail(event) {
+  if (event.event === "plan" && event.chart_requirements !== undefined) {
+    return {
+      intent: event.intent || "-",
+      analysis_type: event.analysis_type || "-",
+      metrics: event.metrics || [],
+      dimensions: event.dimensions || [],
+      filters: event.filters || {},
+      chart_requirements: event.chart_requirements || [],
+      required_agents: event.required_agents || [],
+      required_views: event.required_views || [],
+      followup_reference: event.followup_reference || "-",
+      confidence: event.confidence ?? "-",
+      reasoning_summary: event.reasoning_summary || "-",
+      refined: Boolean(event.refined),
+    };
+  }
   if (event.event === "plan") {
     return {
       意图: event.intent || "-",

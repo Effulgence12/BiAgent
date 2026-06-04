@@ -58,6 +58,7 @@ class AnalyzeResponse(BaseModel):
     forecast_diagnostics: dict[str, Any]
     recommendations: list[str]
     session_id: str
+    planner_plan: dict[str, Any]
 
 
 def _resolve_session(session_id: str | None) -> str:
@@ -78,9 +79,41 @@ def _memory_snapshot(session_id: str) -> dict[str, Any]:
     }
 
 
+def _needs_conversation_context(question: str, error_context: str = "") -> bool:
+    """仅在真实追问或失败重试时注入历史，避免独立问题被上一轮污染。"""
+    if error_context:
+        return True
+    text = question.lower()
+    return any(
+        keyword in text
+        for keyword in (
+            "继续",
+            "刚才",
+            "刚刚",
+            "其中",
+            "该州",
+            "该品类",
+            "该图",
+            "该趋势",
+            "这个州",
+            "这个品类",
+            "这个趋势",
+            "那个州",
+            "那个品类",
+            "上述",
+            "前面",
+            "上轮",
+            "上一轮",
+            "重试",
+            "原问题",
+            "retry",
+        )
+    )
+
+
 def _contextual_question(session_id: str, question: str, error_context: str = "") -> str:
     history = SESSIONS.get(session_id, [])
-    if not history:
+    if not history or not _needs_conversation_context(question, error_context):
         return f"当前用户问题：{question}\n\n上一轮失败错误：{error_context}\n请修复并回答原问题。" if error_context else question
     recent = history[-3:]
     turns = []
@@ -117,6 +150,7 @@ def _remember(session_id: str, question: str, workflow, matched_views: list[str]
             "summary": workflow.data_analysis.summary,
             "matched_views": matched_views,
             "sql_tasks": [{"name": task.name, "purpose": task.purpose, "sql": task.sql.strip()} for task in workflow.data_analysis.tasks],
+            "planner_plan": workflow.plan.to_context(),
         }
     )
     SESSIONS[session_id] = SESSIONS[session_id][-6:]
@@ -200,6 +234,7 @@ def analyze(payload: AnalyzeRequest) -> AnalyzeResponse:
         forecast=workflow.forecast,
         forecast_diagnostics=workflow.forecast_diagnostics,
         recommendations=workflow.recommendations,
+        planner_plan=workflow.plan.to_context(),
     )
 
 
@@ -244,11 +279,18 @@ async def analyze_ws(websocket: WebSocket) -> None:
                 "required_agents": list(plan.required_agents),
                 "required_views": list(plan.required_views),
                 "followup_reference": plan.followup_reference,
+                "metrics": list(plan.metrics),
+                "dimensions": list(plan.dimensions),
+                "filters": plan.filters,
+                "chart_requirements": list(plan.chart_requirements),
+                "confidence": plan.confidence,
+                "reasoning_summary": plan.reasoning_summary,
+                "planner_raw": plan.planner_raw,
             }
         )
         await websocket.send_json({"event": "agent_done", "agent": "orchestrator"})
         await websocket.send_json({"event": "agent_start", "agent": "data_analyst"})
-        workflow = run_workflow(contextual_question, generate_recommendations=False)
+        workflow = run_workflow(contextual_question, generate_recommendations=False, initial_plan=plan)
     except DatasetValidationError as exc:
         _remember_failed(session_id, question, str(exc), "data_error", request_id, retry_of)
         await websocket.send_json({"event": "data_error", "error": str(exc), "request_id": request_id, "question": question})
@@ -275,6 +317,13 @@ async def analyze_ws(websocket: WebSocket) -> None:
                 "required_agents": list(workflow.plan.required_agents),
                 "required_views": list(workflow.plan.required_views),
                 "followup_reference": workflow.plan.followup_reference,
+                "metrics": list(workflow.plan.metrics),
+                "dimensions": list(workflow.plan.dimensions),
+                "filters": workflow.plan.filters,
+                "chart_requirements": list(workflow.plan.chart_requirements),
+                "confidence": workflow.plan.confidence,
+                "reasoning_summary": workflow.plan.reasoning_summary,
+                "planner_raw": workflow.plan.planner_raw,
                 "refined": True,
             }
         )

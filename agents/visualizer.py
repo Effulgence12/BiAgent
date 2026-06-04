@@ -58,6 +58,24 @@ def _as_float(value: object) -> float:
         return 0.0
 
 
+def _clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
+    return max(low, min(high, value))
+
+
+def _hex_color(start: str, end: str, ratio: float) -> str:
+    ratio = _clamp(ratio)
+    s = tuple(int(start[index : index + 2], 16) for index in (1, 3, 5))
+    e = tuple(int(end[index : index + 2], 16) for index in (1, 3, 5))
+    return "#" + "".join(f"{round(sv + (ev - sv) * ratio):02x}" for sv, ev in zip(s, e))
+
+
+def _format_rate(value: object) -> str:
+    try:
+        return f"{float(value) * 100:.2f}%"
+    except (TypeError, ValueError):
+        return "未知"
+
+
 def _first_column(columns: list[str], *candidates: str) -> str:
     for candidate in candidates:
         if candidate in columns:
@@ -230,23 +248,117 @@ def _bubble_chart(name: str, result: QueryResult, include_js: bool) -> ChartSpec
     return ChartSpec(_chart_id("bubble"), "产品重量/体积与运费关系", "plotly_bubble", _source_view(name, result), _with_evidence_table(_plotly_html(fig, include_js), result), "气泡大小表示订单量，颜色区分配送状态或地区。")
 
 
-def _geo_map(name: str, result: QueryResult) -> ChartSpec:
+def _geo_metric_from_requirements(chart_requirements: list[dict[str, Any]] | tuple[dict[str, Any], ...], columns: set[str]) -> str:
+    """Use the Orchestrator's chart metric when the result columns can support it."""
+    text = " ".join(
+        str(value).lower()
+        for requirement in chart_requirements
+        if isinstance(requirement, dict)
+        for value in requirement.values()
+    )
+    if any(metric in text for metric in ("delivery_late_rate", "late_rate", "delivery_delay", "logistics_risk")) and {"late_rate", "late_orders"}.issubset(columns):
+        return "delivery_late"
+    if any(metric in text for metric in ("delivery_on_time_rate", "on_time_rate", "fulfillment_rate")) and "on_time_rate" in columns:
+        return "delivery_on_time"
+    if any(metric in text for metric in ("seller_review_risk", "seller_score", "review_risk")) and "avg_review_score" in columns:
+        return "seller_review_risk"
+    if any(metric in text for metric in ("sales_gmv", "total_gmv", "order_volume")) and "total_gmv" in columns:
+        return "sales"
+    return ""
+
+
+def _geo_map(name: str, result: QueryResult, chart_requirements: list[dict[str, Any]] | tuple[dict[str, Any], ...] = ()) -> ChartSpec:
     rows = [row for row in result.rows if row.get("lat") not in (None, "") and row.get("lng") not in (None, "")]
-    fmap = folium.Map(location=[-14.2, -51.9], zoom_start=4, tiles="CartoDB positron")
-    max_value = max((_as_float(row.get("total_gmv")) for row in rows), default=1.0)
+    fmap = folium.Map(location=[-14.2, -51.9], zoom_start=4, tiles="CartoDB positron", width="100%", height="520px")
+    columns = set(result.columns)
+    metric = _geo_metric_from_requirements(chart_requirements, columns)
+    if not metric:
+        metric = str(rows[0].get("map_metric") or "") if rows else ""
+    if not metric:
+        if {"late_rate", "late_orders"}.issubset(columns):
+            metric = "delivery_late"
+        elif "on_time_rate" in columns:
+            metric = "delivery_on_time"
+        elif "avg_review_score" in columns:
+            metric = "seller_review_risk"
+        else:
+            metric = "sales"
+
+    if metric == "delivery_late":
+        title = "各州配送延迟地图"
+        source_view = "mv_state_geo + mv_delivery_perf"
+        summary = "颜色越红表示延迟率越高，气泡越大表示延迟订单越多。"
+        size_key = "late_orders"
+        max_size = max((_as_float(row.get(size_key)) for row in rows), default=1.0) or 1.0
+        max_late_rate = max((_as_float(row.get("late_rate")) for row in rows), default=1.0) or 1.0
+    elif metric == "delivery_on_time":
+        title = "各州准时交付率地图"
+        source_view = "mv_state_geo + mv_delivery_perf"
+        summary = "颜色从红到绿表示准时交付率由低到高，气泡大小表示订单量。"
+        size_key = "total_orders"
+        max_size = max((_as_float(row.get(size_key)) for row in rows), default=1.0) or 1.0
+    elif metric == "seller_review_risk":
+        title = "州级卖家评分风险地图"
+        source_view = "mv_state_geo + mv_seller_perf"
+        summary = "颜色越红表示平均评分越低，气泡大小表示卖家订单量。"
+        size_key = "total_orders"
+        max_size = max((_as_float(row.get(size_key)) for row in rows), default=1.0) or 1.0
+    else:
+        title = "巴西州级销售气泡地图"
+        source_view = _source_view(name, result)
+        summary = "基于州质心经纬度展示销售额和订单量分布。"
+        size_key = "total_gmv"
+        max_size = max((_as_float(row.get(size_key)) for row in rows), default=1.0) or 1.0
+
     for row in rows:
-        value = _as_float(row.get("total_gmv"))
-        radius = 5 + 22 * (value / max_value) ** 0.5
+        size_value = _as_float(row.get(size_key))
+        radius = 5 + 22 * (size_value / max_size) ** 0.5
+        if metric == "delivery_late":
+            late_rate = _as_float(row.get("late_rate"))
+            color = _hex_color("#fca5a5", "#b91c1c", late_rate / max_late_rate)
+            popup = (
+                f"{row.get('customer_state')}<br>"
+                f"延迟率: {_format_rate(row.get('late_rate'))}<br>"
+                f"延迟订单: {row.get('late_orders')}<br>"
+                f"平均配送天数: {row.get('avg_delivery_days')}<br>"
+                f"订单数: {row.get('total_orders')}"
+            )
+        elif metric == "delivery_on_time":
+            on_time_rate = _as_float(row.get("on_time_rate"))
+            color = _hex_color("#dc2626", "#16a34a", on_time_rate)
+            popup = (
+                f"{row.get('customer_state')}<br>"
+                f"准时交付率: {_format_rate(row.get('on_time_rate'))}<br>"
+                f"延迟率: {_format_rate(row.get('late_rate'))}<br>"
+                f"平均配送天数: {row.get('avg_delivery_days')}<br>"
+                f"订单数: {row.get('total_orders')}"
+            )
+        elif metric == "seller_review_risk":
+            score = _as_float(row.get("avg_review_score"))
+            risk = _clamp((5.0 - score) / 4.0)
+            color = _hex_color("#93c5fd", "#dc2626", risk)
+            popup = (
+                f"{row.get('customer_state')}<br>"
+                f"平均评分: {row.get('avg_review_score')}<br>"
+                f"卖家订单数: {row.get('total_orders')}<br>"
+                f"卖家GMV: {_as_float(row.get('total_gmv')):,.2f}"
+            )
+        else:
+            value = _as_float(row.get("total_gmv"))
+            color = "#1f6feb"
+            popup = f"{row.get('customer_state')}<br>GMV: {value:,.2f}<br>Orders: {row.get('total_orders')}"
         folium.CircleMarker(
             location=[_as_float(row.get("lat")), _as_float(row.get("lng"))],
             radius=radius,
-            color="#1f6feb",
+            color=color,
             fill=True,
-            fill_color="#2a6fbb",
-            fill_opacity=0.58,
-            popup=f"{row.get('customer_state')}<br>GMV: {value:,.2f}<br>Orders: {row.get('total_orders')}",
+            fill_color=color,
+            fill_opacity=0.62,
+            popup=popup,
         ).add_to(fmap)
-    return ChartSpec(_chart_id("map"), "巴西州级销售气泡地图", "folium_map", _source_view(name, result), _with_evidence_table(fmap._repr_html_(), result), "基于州质心经纬度展示销售额和订单量分布。")
+    map_html = fmap.get_root().render()
+    iframe = f"<iframe class='folium-frame' title='{escape(title)}' srcdoc=\"{escape(map_html, quote=True)}\"></iframe>"
+    return ChartSpec(_chart_id("map"), title, f"folium_map_{metric}", source_view, _with_evidence_table(iframe, result), summary)
 
 
 def _review_reason_chart(name: str, result: QueryResult, include_js: bool) -> ChartSpec:
@@ -272,9 +384,14 @@ def _table_chart(name: str, result: QueryResult) -> ChartSpec:
     return ChartSpec(_chart_id("table"), "数据明细", "table", _source_view(name, result), _table_html(result.rows), "查询结果明细表。")
 
 
-def render_charts(results: dict[str, QueryResult], forecast: list[dict[str, Any]] | None = None) -> list[dict[str, str]]:
+def render_charts(
+    results: dict[str, QueryResult],
+    forecast: list[dict[str, Any]] | None = None,
+    chart_requirements: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None = None,
+) -> list[dict[str, str]]:
     """Return structured Plotly/Folium chart specs for the dashboard."""
     forecast = forecast or []
+    chart_requirements = chart_requirements or []
     charts: list[ChartSpec] = []
     include_js = True
     for name, result in results.items():
@@ -287,7 +404,7 @@ def render_charts(results: dict[str, QueryResult], forecast: list[dict[str, Any]
         elif {"year_month", "total_gmv"}.issubset(columns):
             chart = _line_chart(name, result, [], include_js)
         elif {"customer_state", "lat", "lng"}.issubset(columns):
-            chart = _geo_map(name, result)
+            chart = _geo_map(name, result, chart_requirements)
         elif {"payment_type", "payment_installments"}.issubset(columns):
             chart = _heatmap_chart(name, result, include_js)
         elif {"avg_weight_g", "avg_freight"}.issubset(columns) or {"product_weight_g", "freight_value"}.issubset(columns):
@@ -307,9 +424,13 @@ def render_charts(results: dict[str, QueryResult], forecast: list[dict[str, Any]
     return [chart.to_dict() for chart in charts]
 
 
-def render_chart_gallery(results: dict[str, QueryResult], forecast: list[dict[str, Any]] | None = None) -> str:
+def render_chart_gallery(
+    results: dict[str, QueryResult],
+    forecast: list[dict[str, Any]] | None = None,
+    chart_requirements: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None = None,
+) -> str:
     """Render all charts as a single HTML fragment for backward compatibility."""
-    charts = render_charts(results, forecast)
+    charts = render_charts(results, forecast, chart_requirements=chart_requirements)
     return "".join(f"<section class='chart-block'>{chart['html']}</section>" for chart in charts)
 
 

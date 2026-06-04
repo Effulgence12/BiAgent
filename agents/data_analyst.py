@@ -61,6 +61,24 @@ def _extract_json_object(content: str) -> dict[str, Any]:
 def _normalize_sql(sql: str) -> str:
     """修正常见的只读 SQL 方言差异，避免合法意图被 SQLite 语法细节拦住。"""
     normalized = sql.strip().rstrip(";")
+    percentile_pattern = re.compile(
+        r"\(\s*select\s+percentile_cont\((0?\.\d+|1(?:\.0+)?)\)\s+within\s+group\s*"
+        r"\(\s*order\s+by\s+([A-Za-z_][A-Za-z0-9_.]*)\s*\)\s+from\s+([A-Za-z_][A-Za-z0-9_]*)\s+"
+        r"where\s+(.+?)\)\s+as\s+([A-Za-z_][A-Za-z0-9_]*)",
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    def _replace_percentile(match: re.Match[str]) -> str:
+        percentile, order_column, table_name, where_clause, alias = match.groups()
+        where_clause = where_clause.strip()
+        return (
+            f"(SELECT {order_column} FROM {table_name} WHERE {where_clause} "
+            f"ORDER BY {order_column} LIMIT 1 OFFSET ("
+            f"SELECT CAST((COUNT(*) - 1) * {float(percentile):.4f} AS INTEGER) "
+            f"FROM {table_name} WHERE {where_clause})) AS {alias}"
+        )
+
+    normalized = percentile_pattern.sub(_replace_percentile, normalized)
     cte_match = re.match(
         r"^\s*with\s+([A-Za-z_][A-Za-z0-9_]*)\s+as\s*\(\s*(select\b.+?\border\s+by\b.+?\blimit\s+\d+)\s+union\s+all\s+(select\b.+?\border\s+by\b.+?\blimit\s+\d+)\s*\)\s+(select\b.+)$",
         normalized,
@@ -95,7 +113,66 @@ def _validate_sql(sql: str) -> str:
     return normalized
 
 
-def plan_tasks_with_llm(question: str) -> tuple[QueryTask, ...]:
+def _split_sql_statements(sql: str) -> list[str]:
+    """拆开模型误放在同一个任务里的多条只读 SQL。"""
+    cleaned = sql.strip()
+    if ";" not in cleaned:
+        return [cleaned] if cleaned else []
+    statements: list[str] = []
+    current: list[str] = []
+    quote: str | None = None
+    index = 0
+    while index < len(cleaned):
+        char = cleaned[index]
+        current.append(char)
+        if quote:
+            if char == quote:
+                next_char = cleaned[index + 1] if index + 1 < len(cleaned) else ""
+                if next_char == quote:
+                    current.append(next_char)
+                    index += 1
+                else:
+                    quote = None
+        elif char in ("'", '"'):
+            quote = char
+        elif char == ";":
+            statement = "".join(current).strip().rstrip(";").strip()
+            if statement:
+                statements.append(statement)
+            current = []
+        index += 1
+    tail = "".join(current).strip().rstrip(";").strip()
+    if tail:
+        statements.append(tail)
+    return statements
+
+
+def _plan_context_json(plan_context: dict[str, Any] | None) -> str:
+    """Serialize the Orchestrator plan so SQL planning can follow agent-level intent."""
+    if not plan_context:
+        return "无"
+    return json.dumps(plan_context, ensure_ascii=False, indent=2)
+
+
+def _plan_strings(plan_context: dict[str, Any] | None) -> list[str]:
+    """Collect planner metrics/views/chart hints for guardrail checks."""
+    if not plan_context:
+        return []
+    values: list[str] = []
+    for key in ("analysis_type", "intent", "followup_reference", "reasoning_summary"):
+        if plan_context.get(key):
+            values.append(str(plan_context[key]))
+    for key in ("metrics", "dimensions", "required_views"):
+        raw = plan_context.get(key)
+        if isinstance(raw, (list, tuple)):
+            values.extend(str(item) for item in raw)
+    for item in plan_context.get("chart_requirements") or []:
+        if isinstance(item, dict):
+            values.extend(str(value) for value in item.values() if value)
+    return values
+
+
+def plan_tasks_with_llm(question: str, plan_context: dict[str, Any] | None = None) -> tuple[QueryTask, ...]:
     """Use the configured remote LLM as the runtime SQL planner.
 
     这里不做本地模板兜底：模型不可用、JSON 非法或 SQL 非只读都会向上抛错，
@@ -117,6 +194,7 @@ def plan_tasks_with_llm(question: str) -> tuple[QueryTask, ...]:
 5. 需要预测未来6周时，请至少返回 mv_weekly_sales 的 week_start,total_gmv 序列。
 6. 地图/地域问题优先使用 mv_state_geo；差评原因优先使用 mv_review_category_perf；重量运费优先使用 mv_weight_freight。
 7. 基础表只允许这些：{allowed_base_tables}。
+8. 不要使用 PERCENTILE_CONT、WITHIN GROUP、DATE_TRUNC、INTERVAL 等非 SQLite 语法；需要分位数时请用 ORDER BY + LIMIT/OFFSET 近似。
 
 只返回 JSON，不要 Markdown。格式：
 {{
@@ -125,6 +203,8 @@ def plan_tasks_with_llm(question: str) -> tuple[QueryTask, ...]:
   ]
 }}
 """.strip()
+    if plan_context:
+        prompt = f"协调器结构化计划：\n{_plan_context_json(plan_context)}\n\n{prompt}"
     response = chat_completion(DATA_ANALYST_SYSTEM_PROMPT, prompt, max_tokens=1800)
     payload = _extract_json_object(response.content)
     raw_tasks = payload.get("tasks")
@@ -139,11 +219,18 @@ def plan_tasks_with_llm(question: str) -> tuple[QueryTask, ...]:
             raise ValueError("大模型 SQL 任务缺少 sql")
         name = str(raw_task.get("name") or f"task_{index}").strip()
         purpose = str(raw_task.get("purpose") or name).strip()
-        tasks.append(QueryTask(name=name, sql=_validate_sql(raw_sql), purpose=purpose))
+        statements = _split_sql_statements(raw_sql)
+        for statement_index, statement in enumerate(statements, start=1):
+            task_name = name if len(statements) == 1 else f"{name}_{statement_index}"
+            tasks.append(QueryTask(name=task_name, sql=_validate_sql(statement), purpose=purpose))
+            if len(tasks) >= 6:
+                break
+        if len(tasks) >= 6:
+            break
     return tuple(tasks)
 
 
-def repair_tasks_with_llm(question: str, failed_tasks: tuple[QueryTask, ...], error: str) -> tuple[QueryTask, ...]:
+def repair_tasks_with_llm(question: str, failed_tasks: tuple[QueryTask, ...], error: str, plan_context: dict[str, Any] | None = None) -> tuple[QueryTask, ...]:
     """Ask the remote LLM to repair invalid SQL once execution exposes an error."""
     prompt = f"""
 用户问题：
@@ -163,6 +250,7 @@ def repair_tasks_with_llm(question: str, failed_tasks: tuple[QueryTask, ...], er
 2. 优先使用 mv_* 预聚合表。
 3. 所有 SQL 必须是 SQLite 兼容的只读 SELECT 或 WITH。
 4. 不要引用不存在的表别名或字段。
+5. 不要使用 PERCENTILE_CONT、WITHIN GROUP、DATE_TRUNC、INTERVAL 等非 SQLite 语法；需要分位数时请用 ORDER BY + LIMIT/OFFSET 近似。
 
 只返回 JSON，不要 Markdown。格式：
 {{
@@ -171,6 +259,8 @@ def repair_tasks_with_llm(question: str, failed_tasks: tuple[QueryTask, ...], er
   ]
 }}
 """.strip()
+    if plan_context:
+        prompt = f"协调器结构化计划：\n{_plan_context_json(plan_context)}\n\n{prompt}"
     response = chat_completion(DATA_ANALYST_SYSTEM_PROMPT, prompt, max_tokens=1800)
     payload = _extract_json_object(response.content)
     raw_tasks = payload.get("tasks")
@@ -185,7 +275,14 @@ def repair_tasks_with_llm(question: str, failed_tasks: tuple[QueryTask, ...], er
             raise ValueError("大模型 SQL 修复任务缺少 sql")
         name = str(raw_task.get("name") or f"repaired_task_{index}").strip()
         purpose = str(raw_task.get("purpose") or name).strip()
-        tasks.append(QueryTask(name=name, sql=_validate_sql(raw_sql), purpose=purpose))
+        statements = _split_sql_statements(raw_sql)
+        for statement_index, statement in enumerate(statements, start=1):
+            task_name = name if len(statements) == 1 else f"{name}_{statement_index}"
+            tasks.append(QueryTask(name=task_name, sql=_validate_sql(statement), purpose=purpose))
+            if len(tasks) >= 6:
+                break
+        if len(tasks) >= 6:
+            break
     return tuple(tasks)
 
 
@@ -204,9 +301,9 @@ class DataAnalysis:
     direct_answer: str
 
 
-def draft_tasks(question: str) -> tuple[QueryTask, ...]:
+def draft_tasks(question: str, plan_context: dict[str, Any] | None = None) -> tuple[QueryTask, ...]:
     """Ask the real LLM to plan view-first SQL tasks for the user question."""
-    return plan_tasks_with_llm(question)
+    return plan_tasks_with_llm(question, plan_context=plan_context)
 
 
 def draft_sql(question: str) -> AnalysisDraft:
@@ -257,6 +354,7 @@ def build_direct_answer_from_results(question: str, results: dict[str, QueryResu
     text = question.lower()
     all_results = list(results.values())
     is_strategy = any(keyword in text for keyword in ("策略", "建议", "方案", "降低", "改进", "3个月", "三大"))
+    is_delivery_focus = any(keyword in text for keyword in ("配送", "交付", "延迟", "准时", "物流", "履约", "风险热区", "delivery", "late", "on time", "on-time"))
     on_time_result = results.get("delivery_overall") or next(
         (
             result
@@ -284,10 +382,93 @@ def build_direct_answer_from_results(question: str, results: dict[str, QueryResu
     review_result = results.get("review_category") or next((result for result in all_results if "product_category_name" in result.columns and any(column in result.columns for column in ("negative_rate", "bad_review_rate", "negative_reviews", "delay_complaints", "quality_complaints"))), None)
     seller_result = results.get("seller_review") or next((result for result in all_results if "seller_id" in result.columns and any(column in result.columns for column in ("avg_review_score", "negative_rate"))), None)
     delivery_duration_result = results.get("delivery_by_state") or next((result for result in all_results if "customer_state" in result.columns and any(column in result.columns for column in ("avg_delivery_days", "state_avg_days"))), None)
+    weight_result = next((result for result in all_results if any(column in result.columns for column in ("avg_weight_g", "product_weight_g")) and any(column in result.columns for column in ("avg_freight", "freight_value"))), None)
+
+    is_payment_focus = any(keyword in text for keyword in ("支付", "分期", "payment", "installment", "boleto", "credit"))
+    is_review_focus = any(keyword in text for keyword in ("差评", "评分", "评价", "评论", "低分", "反馈", "review", "negative"))
+    is_seller_focus = any(keyword in text for keyword in ("卖家", "seller"))
+    is_weight_focus = any(keyword in text for keyword in ("重量", "尺寸", "体积", "运费", "运力成本", "weight", "freight"))
+    is_category_focus = any(keyword in text for keyword in ("品类", "产品组", "category", "health_beauty"))
+    is_forecast_focus = any(keyword in text for keyword in ("预测", "未来6周", "未来六周", "区间", "forecast"))
 
     if is_strategy:
         return "已基于真实查询结果综合销售、配送、评价、卖家和商品维度，三个月内应优先处理高延迟地区、低评分卖家/品类和影响体验的履约问题；具体执行建议见下方大模型建议。"
-    if state_sales_result and state_sales_result.rows and (payment_result or late_state_result or delivery_duration_result):
+    if is_forecast_focus and weekly_result and weekly_result.rows:
+        return f"已基于 {len(weekly_result.rows)} 周真实GMV序列生成未来6周预测，预测值、上下界区间和误差诊断见预测图表。"
+    if state_sales_result and state_sales_result.rows and payment_result and (late_state_result or delivery_duration_result) and "州" in text:
+        top_state = state_sales_result.rows[0]
+        state = top_state.get("customer_state")
+        delivery_row: dict[str, Any] = {}
+        if delivery_duration_result:
+            delivery_row = next((row for row in delivery_duration_result.rows if row.get("customer_state") == state), {})
+        if not delivery_row and late_state_result:
+            delivery_row = next((row for row in late_state_result.rows if row.get("customer_state") == state), {})
+        payment_row = payment_result.rows[0] if payment_result and payment_result.rows else {}
+        on_time_rate = _first_value(delivery_row, "on_time_rate")
+        late_rate = _first_value(delivery_row, "late_rate")
+        if on_time_rate is None and late_rate is not None:
+            try:
+                on_time_rate = 1 - float(late_rate)
+            except (TypeError, ValueError):
+                on_time_rate = None
+        return (
+            f"销售额最高的州是 {state}，GMV约 {float(_first_value(top_state, 'total_gmv', 'total_sales') or 0):,.2f}；"
+            f"该州准时交付率为 {_percent(on_time_rate)}；"
+            f"最受欢迎支付方式是 {payment_row.get('payment_type', '见SQL结果')}。"
+        )
+    if is_payment_focus and payment_result and payment_result.rows:
+        top = payment_result.rows[0]
+        count = _first_value(top, "payment_count", "total_transactions", "transaction_count", "total_orders", "total_count", "count")
+        avg = _first_value(top, "avg_installments", "average_installments", "avg_payment_installments")
+        if avg is None and avg_installment_result:
+            avg_row = next((row for row in avg_installment_result.rows if row.get("payment_type") == top.get("payment_type")), avg_installment_result.rows[0] if avg_installment_result.rows else {})
+            avg = _first_value(avg_row, "avg_installments", "average_installments", "avg_payment_installments")
+        return f"支付分布显示最主要方式是 {top.get('payment_type')}，交易数 {count}；平均分期数约 {avg if avg is not None else '见SQL结果'}，高分期和金额差异见热力图/SQL证据。"
+    if is_seller_focus and seller_result and seller_result.rows:
+        seller = seller_result.rows[0]
+        state = seller.get("seller_state", seller.get("customer_state", "见SQL结果"))
+        score = _first_value(seller, "avg_review_score")
+        negative_rate = _first_value(seller, "negative_rate")
+        metric = f"差评率 {_percent(negative_rate)}" if negative_rate is not None else f"平均评分 {score}"
+        return f"需优先关注卖家 {seller.get('seller_id', '见SQL结果')}（州 {state}），其{metric}，订单数 {seller.get('total_orders', '见SQL结果')}。"
+    if is_review_focus and review_result and review_result.rows:
+        top = review_result.rows[0]
+        delay_total = sum(int(_first_value(row, "delay_complaints") or 0) for row in review_result.rows)
+        quality_total = sum(int(_first_value(row, "quality_complaints") or 0) for row in review_result.rows)
+        reason_hint = f"整体看物流延迟投诉 {delay_total} 次、质量投诉 {quality_total} 次；" if delay_total or quality_total else ""
+        negative_rate = _first_value(top, "negative_rate", "bad_review_rate")
+        negative_reviews = _first_value(top, "negative_reviews", "bad_reviews", "low_score_reviews")
+        return f"{reason_hint}差评风险最高品类为 {top.get('product_category_name')}，差评率 {_percent(negative_rate)}，差评数 {negative_reviews}。"
+    if is_weight_focus and weight_result and weight_result.rows:
+        top = weight_result.rows[0]
+        return (
+            f"已按重量/体积分组返回运费证据；样本中 {top.get('weight_bucket', '相关分组')} "
+            f"平均重量约 {_first_value(top, 'avg_weight_g', 'product_weight_g') or '见SQL结果'}g，"
+            f"平均运费约 {_first_value(top, 'avg_freight', 'freight_value') or '见SQL结果'}。"
+        )
+    if is_category_focus and category_result and category_result.rows:
+        top = category_result.rows[0]
+        review_row = review_result.rows[0] if review_result and review_result.rows else {}
+        total_gmv = float(_first_value(top, "total_gmv", "total_sales") or 0)
+        extra = f"；评分/差评证据显示 {review_row.get('product_category_name')} 差评率 {_percent(_first_value(review_row, 'negative_rate', 'bad_review_rate'))}" if review_row else ""
+        return f"品类表现最高的是 {top.get('product_category_name')}，GMV约 {total_gmv:,.2f}，订单数 {top.get('total_orders', '见SQL结果')}{extra}。"
+    if is_delivery_focus and (on_time_result or late_state_result) and not payment_result and not seller_result:
+        overall = on_time_result.rows[0] if on_time_result and on_time_result.rows else {}
+        states = late_state_result.rows[:5] if late_state_result else []
+        state_part = "；".join(
+            f"{row.get('customer_state')} 延迟率{_percent(row.get('late_rate'))}，延迟订单{row.get('late_orders', '见SQL结果')}"
+            for row in states
+        )
+        on_time_rate = overall.get("overall_on_time_rate", overall.get("on_time_rate"))
+        late_rate = overall.get("overall_late_rate")
+        if late_rate is None and on_time_rate is not None:
+            try:
+                late_rate = 1 - float(on_time_rate)
+            except (TypeError, ValueError):
+                late_rate = None
+        prefix = f"平台整体准时交付率为 {_percent(on_time_rate)}，延迟率为 {_percent(late_rate)}。" if overall else ""
+        return f"{prefix}物流风险较高的州：{state_part}。"
+    if state_sales_result and state_sales_result.rows and (payment_result or late_state_result or delivery_duration_result) and not seller_result:
         top_state = state_sales_result.rows[0]
         state = top_state.get("customer_state")
         delivery_row: dict[str, Any] = {}
@@ -400,7 +581,6 @@ def build_direct_answer_from_results(question: str, results: dict[str, QueryResu
             f"品类表现最高的是 {top.get('product_category_name')}，GMV约 {total_gmv:,.2f}，"
             f"订单数 {top.get('total_orders', '见SQL结果')}，客单价约 {avg_order_value if avg_order_value is not None else '见SQL结果'}。"
         )
-    weight_result = next((result for result in all_results if any(column in result.columns for column in ("avg_weight_g", "product_weight_g")) and any(column in result.columns for column in ("avg_freight", "freight_value"))), None)
     if weight_result and weight_result.rows:
         return "已按重量区间与配送状态返回平均重量、体积、运费和订单量，可用于判断重量/尺寸与运费的关系。"
     if "delivery_performance" in results:
@@ -487,6 +667,72 @@ SUPPLEMENTAL_TASKS: dict[str, QueryTask] = {
         "SELECT customer_state, lat, lng, total_orders, total_gmv, avg_order_value FROM mv_state_geo WHERE lat IS NOT NULL AND lng IS NOT NULL ORDER BY total_gmv DESC LIMIT 27",
         "地图可视化所需的巴西州级经纬度与销售分布",
     ),
+    "delivery_geo_map": QueryTask(
+        "delivery_geo_map",
+        """
+        SELECT
+          g.customer_state,
+          g.lat,
+          g.lng,
+          d.total_orders,
+          g.total_gmv,
+          g.avg_order_value,
+          d.avg_delivery_days,
+          d.late_orders,
+          d.late_rate,
+          d.on_time_rate,
+          'delivery_late' AS map_metric
+        FROM mv_state_geo g
+        JOIN (
+          SELECT
+            customer_state,
+            SUM(total_orders) AS total_orders,
+            ROUND(SUM(avg_delivery_days * total_orders) / NULLIF(SUM(total_orders), 0), 2) AS avg_delivery_days,
+            SUM(late_orders) AS late_orders,
+            ROUND(1.0 * SUM(late_orders) / NULLIF(SUM(total_orders), 0), 4) AS late_rate,
+            ROUND(1.0 - 1.0 * SUM(late_orders) / NULLIF(SUM(total_orders), 0), 4) AS on_time_rate
+          FROM mv_delivery_perf
+          GROUP BY customer_state
+        ) d ON g.customer_state = d.customer_state
+        WHERE g.lat IS NOT NULL AND g.lng IS NOT NULL
+        ORDER BY d.late_rate DESC, d.late_orders DESC
+        LIMIT 27
+        """,
+        "地图可视化所需的州级经纬度与配送延迟指标",
+    ),
+    "on_time_geo_map": QueryTask(
+        "on_time_geo_map",
+        """
+        SELECT
+          g.customer_state,
+          g.lat,
+          g.lng,
+          d.total_orders,
+          g.total_gmv,
+          g.avg_order_value,
+          d.avg_delivery_days,
+          d.late_orders,
+          d.late_rate,
+          d.on_time_rate,
+          'delivery_on_time' AS map_metric
+        FROM mv_state_geo g
+        JOIN (
+          SELECT
+            customer_state,
+            SUM(total_orders) AS total_orders,
+            ROUND(SUM(avg_delivery_days * total_orders) / NULLIF(SUM(total_orders), 0), 2) AS avg_delivery_days,
+            SUM(late_orders) AS late_orders,
+            ROUND(1.0 * SUM(late_orders) / NULLIF(SUM(total_orders), 0), 4) AS late_rate,
+            ROUND(1.0 - 1.0 * SUM(late_orders) / NULLIF(SUM(total_orders), 0), 4) AS on_time_rate
+          FROM mv_delivery_perf
+          GROUP BY customer_state
+        ) d ON g.customer_state = d.customer_state
+        WHERE g.lat IS NOT NULL AND g.lng IS NOT NULL
+        ORDER BY d.on_time_rate ASC, d.total_orders DESC
+        LIMIT 27
+        """,
+        "地图可视化所需的州级经纬度与准时交付率指标",
+    ),
     "delivery_overall": QueryTask(
         "delivery_overall",
         "SELECT SUM(total_orders) AS total_orders, ROUND(1.0 * SUM(late_orders) / NULLIF(SUM(total_orders), 0), 4) AS overall_late_rate, ROUND(1.0 - 1.0 * SUM(late_orders) / NULLIF(SUM(total_orders), 0), 4) AS overall_on_time_rate, ROUND(SUM(avg_delivery_days * total_orders) / NULLIF(SUM(total_orders), 0), 2) AS avg_delivery_days FROM mv_delivery_perf",
@@ -522,6 +768,33 @@ SUPPLEMENTAL_TASKS: dict[str, QueryTask] = {
         "SELECT seller_id, seller_state, SUM(total_orders) AS total_orders, ROUND(SUM(total_gmv), 2) AS total_gmv, ROUND(AVG(avg_review_score), 2) AS avg_review_score FROM mv_seller_perf GROUP BY seller_id, seller_state HAVING total_orders >= 3 ORDER BY avg_review_score ASC, total_orders DESC LIMIT 20",
         "低评分卖家定位和卖家绩效诊断",
     ),
+    "seller_geo_map": QueryTask(
+        "seller_geo_map",
+        """
+        SELECT
+          g.customer_state,
+          g.lat,
+          g.lng,
+          s.total_orders,
+          s.total_gmv,
+          s.avg_review_score,
+          'seller_review_risk' AS map_metric
+        FROM mv_state_geo g
+        JOIN (
+          SELECT
+            seller_state AS customer_state,
+            SUM(total_orders) AS total_orders,
+            ROUND(SUM(total_gmv), 2) AS total_gmv,
+            ROUND(AVG(avg_review_score), 2) AS avg_review_score
+          FROM mv_seller_perf
+          GROUP BY seller_state
+        ) s ON g.customer_state = s.customer_state
+        WHERE g.lat IS NOT NULL AND g.lng IS NOT NULL
+        ORDER BY s.avg_review_score ASC, s.total_orders DESC
+        LIMIT 27
+        """,
+        "地图可视化所需的州级经纬度与卖家评分风险指标",
+    ),
     "weight_freight": QueryTask(
         "weight_freight",
         "SELECT weight_bucket, delivery_status, order_count, avg_weight_g, avg_volume_cm3, avg_freight, avg_price FROM mv_weight_freight ORDER BY avg_weight_g, delivery_status LIMIT 40",
@@ -539,14 +812,91 @@ def _append_task(tasks: tuple[QueryTask, ...], key: str) -> tuple[QueryTask, ...
     return (*tasks, task)
 
 
-def _supplement_tasks(question: str, tasks: tuple[QueryTask, ...]) -> tuple[QueryTask, ...]:
+def _prepend_task(tasks: tuple[QueryTask, ...], key: str) -> tuple[QueryTask, ...]:
+    """Put the most relevant map evidence first so the dashboard opens on it."""
+    task = SUPPLEMENTAL_TASKS[key]
+    if any(existing.name == task.name for existing in tasks):
+        return tasks
+    if any(existing.sql.strip().lower() == task.sql.strip().lower() for existing in tasks):
+        return tasks
+    return (task, *tasks)
+
+
+def _geo_task_key(question: str = "", plan_context: dict[str, Any] | None = None) -> str:
+    """Choose the state-level map evidence that matches the user's business metric."""
+    plan_text = " ".join(_plan_strings(plan_context)).lower()
+    if any(metric in plan_text for metric in ("delivery_on_time_rate", "on_time_rate", "fulfillment_rate")):
+        return "on_time_geo_map"
+    if any(metric in plan_text for metric in ("delivery_late_rate", "late_rate", "delivery_delay", "logistics_risk")):
+        return "delivery_geo_map"
+    if any(metric in plan_text for metric in ("seller_review_risk", "seller_score", "review_risk")):
+        return "seller_geo_map"
+    if any(metric in plan_text for metric in ("sales_gmv", "total_gmv", "order_volume")):
+        return "state_geo_map"
+
+    text = question.lower()
+    if any(keyword in text for keyword in ("准时", "履约", "on time", "on-time")):
+        return "on_time_geo_map"
+    if any(keyword in text for keyword in ("配送", "交付", "延迟", "late", "delivery", "瓶颈")):
+        return "delivery_geo_map"
+    if any(keyword in text for keyword in ("卖家", "评分", "差评", "review", "seller")):
+        return "seller_geo_map"
+    return "state_geo_map"
+
+
+def _append_tasks_for_view(tasks: tuple[QueryTask, ...], view: str, plan_context: dict[str, Any] | None) -> tuple[QueryTask, ...]:
+    """Translate planner-required views into evidence queries; this does not fabricate answers."""
+    if view == "mv_monthly_sales":
+        return _append_task(tasks, "monthly_sales")
+    if view == "mv_weekly_sales":
+        return _append_task(tasks, "weekly_sales")
+    if view == "mv_state_sales":
+        return _append_task(tasks, "state_sales")
+    if view == "mv_state_geo":
+        return _prepend_task(tasks, _geo_task_key(plan_context=plan_context))
+    if view == "mv_delivery_perf":
+        tasks = _append_task(tasks, "delivery_overall")
+        return _append_task(tasks, "delivery_by_state")
+    if view == "mv_payment_dist":
+        tasks = _append_task(tasks, "payment_summary")
+        return _append_task(tasks, "payment_heatmap")
+    if view == "mv_category_sales":
+        return _append_task(tasks, "category_sales")
+    if view == "mv_review_category_perf":
+        return _append_task(tasks, "review_category")
+    if view == "mv_seller_perf":
+        return _append_task(tasks, "seller_review")
+    if view == "mv_weight_freight":
+        return _append_task(tasks, "weight_freight")
+    return tasks
+
+
+def _supplement_tasks(question: str, tasks: tuple[QueryTask, ...], plan_context: dict[str, Any] | None = None) -> tuple[QueryTask, ...]:
     """Add real mv_* evidence queries for broad BI intents without hardcoded answers."""
+    if plan_context:
+        for requirement in plan_context.get("chart_requirements") or []:
+            if not isinstance(requirement, dict):
+                continue
+            chart_text = " ".join(str(value).lower() for value in requirement.values())
+            if any(keyword in chart_text for keyword in ("map", "geo", "folium", "mv_state_geo")):
+                tasks = _prepend_task(tasks, _geo_task_key(plan_context=plan_context))
+            if "heatmap" in chart_text and "payment" in chart_text:
+                tasks = _append_task(tasks, "payment_heatmap")
+        for view in plan_context.get("required_views") or []:
+            tasks = _append_tasks_for_view(tasks, str(view), plan_context)
+        if plan_context.get("analysis_type") == "predictive":
+            tasks = _append_task(tasks, "monthly_sales")
+            tasks = _append_task(tasks, "weekly_sales")
+        if plan_context.get("analysis_type") == "prescriptive":
+            for key in ("monthly_sales", "state_sales", "delivery_by_state", "category_sales", "payment_summary", "review_category"):
+                tasks = _append_task(tasks, key)
+
     text = question.lower()
     if any(keyword in text for keyword in ("预测", "forecast", "未来6周", "未来 6 周")):
         tasks = _append_task(tasks, "monthly_sales")
         tasks = _append_task(tasks, "weekly_sales")
     if any(keyword in text for keyword in ("地图", "地理", "geo", "map", "巴西", "州级", "州分布")):
-        tasks = _append_task(tasks, "state_geo_map")
+        tasks = _prepend_task(tasks, _geo_task_key(question, plan_context))
     if any(keyword in text for keyword in ("整体运营", "全部分析", "综合", "三大优先", "优先改进", "3个月", "三个月", "策略", "建议")):
         for key in ("monthly_sales", "state_sales", "delivery_by_state", "category_sales", "payment_summary", "review_category"):
             tasks = _append_task(tasks, key)
@@ -607,9 +957,37 @@ def _execute_tasks(tasks: tuple[QueryTask, ...]) -> tuple[dict[str, QueryResult]
     return results, routes
 
 
-def analyze_question(question: str) -> DataAnalysis:
+def _select_primary_task(question: str, tasks: tuple[QueryTask, ...], results: dict[str, QueryResult]) -> QueryTask:
+    """Select the evidence task that best matches the user's current question."""
+    text = question.lower()
+    preferred_names: list[str] = []
+    if any(keyword in text for keyword in ("支付", "分期", "payment", "installment", "boleto", "credit")):
+        preferred_names.extend(["payment_summary", "payment_heatmap"])
+    if any(keyword in text for keyword in ("差评", "评分", "评价", "评论", "低分", "反馈", "review", "negative")):
+        preferred_names.append("review_category")
+    if any(keyword in text for keyword in ("卖家", "seller")):
+        preferred_names.append("seller_review")
+    if any(keyword in text for keyword in ("重量", "尺寸", "体积", "运费", "运力成本", "weight", "freight")):
+        preferred_names.append("weight_freight")
+    if any(keyword in text for keyword in ("预测", "未来6周", "未来六周", "区间", "forecast")):
+        preferred_names.extend(["weekly_sales", "monthly_sales"])
+    if any(keyword in text for keyword in ("配送", "交付", "延迟", "准时", "物流", "履约", "delivery", "late")):
+        preferred_names.extend(["delivery_by_state", "delivery_overall", "delivery_geo_map", "on_time_geo_map"])
+    if any(keyword in text for keyword in ("品类", "产品组", "category", "health_beauty")):
+        preferred_names.append("category_sales")
+    if any(keyword in text for keyword in ("地图", "地理", "geo", "map", "巴西", "州级", "州分布")):
+        preferred_names.extend(["state_geo_map", "delivery_geo_map", "on_time_geo_map", "seller_geo_map"])
+    for preferred_name in preferred_names:
+        for task in tasks:
+            if task.name == preferred_name or task.name.startswith(f"{preferred_name}_"):
+                if task.name in results:
+                    return task
+    return next((task for task in tasks if task.name in results), tasks[0])
+
+
+def analyze_question(question: str, plan_context: dict[str, Any] | None = None) -> DataAnalysis:
     """Draft, route, execute, and summarize a business question."""
-    tasks = _supplement_tasks(question, draft_tasks(question))
+    tasks = _supplement_tasks(question, draft_tasks(question, plan_context=plan_context), plan_context)
     last_error: ValueError | None = None
     for repair_attempt in range(3):
         try:
@@ -619,25 +997,30 @@ def analyze_question(question: str) -> DataAnalysis:
             last_error = exc
             if repair_attempt >= 2:
                 raise ValueError(f"SQL 修复后仍执行失败：{exc}") from exc
-            tasks = _supplement_tasks(question, repair_tasks_with_llm(question, tasks, str(exc)))
+            tasks = _supplement_tasks(question, repair_tasks_with_llm(question, tasks, str(exc), plan_context=plan_context), plan_context)
     else:
         raise ValueError(f"SQL 执行失败：{last_error}")
     # 地图类问题必须有经纬度结果；如果模型只查了州销售表，补查真实 mv_state_geo，
     # 只作为可视化证据补充，不替代大模型生成的业务 SQL。
     needs_geo = any(keyword in question.lower() for keyword in ("地图", "地理", "geo", "map", "巴西", "州级", "州分布", "热力"))
+    plan_values = _plan_strings(plan_context)
+    needs_geo = needs_geo or any(view == "mv_state_geo" for view in (plan_context or {}).get("required_views", [])) or any(
+        "map" in str(item).lower() or "geo" in str(item).lower() for item in plan_values
+    )
     has_geo_result = any({"customer_state", "lat", "lng"}.issubset(result.columns) for result in results.values())
     has_state_result = any("customer_state" in result.columns for result in results.values())
     if needs_geo and has_state_result and not has_geo_result:
-        geo_task = SUPPLEMENTAL_TASKS["state_geo_map"]
+        geo_task = SUPPLEMENTAL_TASKS[_geo_task_key(question, plan_context)]
         results[geo_task.name] = run_query(geo_task.sql)
         routes[geo_task.name] = decide_query_route(geo_task.sql)
         tasks = (*tasks, geo_task)
-    primary = tasks[0]
+    primary = _select_primary_task(question, tasks, results)
     result = results[primary.name]
     route = routes[primary.name]
+    summary_tasks = (primary, *(task for task in tasks if task.name != primary.name))
     summaries = [
         f"{task.purpose}：{summarize_rows(results[task.name].rows, results[task.name].columns)}"
-        for task in tasks
+        for task in summary_tasks
     ]
     direct_answer = build_direct_answer_from_results(question, results)
     return DataAnalysis(
