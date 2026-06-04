@@ -153,61 +153,41 @@ def test_data_analyst_payment_question_hits_payment_view(monkeypatch):
     assert choose_chart(draft.sql) == "heatmap_or_donut"
 
 
-def test_direct_answer_sorts_state_rows_by_metric():
-    result = QueryResult(
-        columns=["customer_state", "total_orders", "avg_order_value"],
-        rows=[
-            {"customer_state": "MG", "total_orders": 11354, "avg_order_value": 158.38},
-            {"customer_state": "RJ", "total_orders": 12350, "avg_order_value": 169.01},
-            {"customer_state": "SP", "total_orders": 40501, "avg_order_value": 143.84},
-        ],
-        elapsed_ms=1.0,
-        row_count=3,
-        source="test",
-    )
-    answer = data_analyst.build_direct_answer_from_results("SP、RJ、MG三个州对比", {"state_compare": result})
-    assert "订单量最高的州是 SP" in answer
-    assert "最低的是 MG" in answer
+def test_synthesize_direct_answer_uses_llm(monkeypatch):
+    captured = {}
 
+    def fake_chat(system, prompt, **kwargs):
+        captured["system"] = system
+        captured["prompt"] = prompt
+        return SimpleNamespace(content="销售额最高的州是 SP，GMV 约 1000。")
 
-def test_direct_answer_prioritizes_payment_focus_over_supplemental_state_rows():
-    payment = QueryResult(
-        columns=["payment_type", "payment_count", "avg_installments"],
-        rows=[{"payment_type": "credit_card", "payment_count": 10, "avg_installments": 3.2}],
+    monkeypatch.setattr(data_analyst, "chat_completion", fake_chat)
+    primary = QueryResult(
+        columns=["customer_state", "total_gmv"],
+        rows=[{"customer_state": "SP", "total_gmv": 1000.0}],
         elapsed_ms=1.0,
         row_count=1,
         source="test",
     )
-    state = QueryResult(
-        columns=["customer_state", "total_gmv", "total_orders"],
-        rows=[{"customer_state": "SP", "total_gmv": 1000, "total_orders": 5}],
-        elapsed_ms=1.0,
-        row_count=1,
-        source="test",
-    )
-    answer = data_analyst.build_direct_answer_from_results("不同支付方式和分期数的订单分布热力图应该怎么看？", {"payment_summary": payment, "state_sales": state})
-    assert "支付分布" in answer
-    assert "销售额最高的州" not in answer
+    answer = data_analyst.synthesize_direct_answer("哪个州销售额最高？", "州销售：返回 1 行", primary)
+    assert answer == "销售额最高的州是 SP，GMV 约 1000。"
+    # 真实问题与数据摘要应作为接地上下文喂给大模型，而不是写死分支。
+    assert "哪个州销售额最高" in captured["prompt"]
+    assert "州销售：返回 1 行" in captured["prompt"]
 
 
-def test_direct_answer_prioritizes_review_focus_over_delivery_rows():
-    review = QueryResult(
-        columns=["product_category_name", "negative_rate", "negative_reviews", "delay_complaints", "quality_complaints"],
-        rows=[{"product_category_name": "bed_bath_table", "negative_rate": 0.2, "negative_reviews": 30, "delay_complaints": 8, "quality_complaints": 12}],
+def test_fallback_direct_answer_is_grounded():
+    primary = QueryResult(
+        columns=["customer_state", "total_gmv"],
+        rows=[{"customer_state": "SP", "total_gmv": 1000.0}],
         elapsed_ms=1.0,
         row_count=1,
         source="test",
     )
-    delivery = QueryResult(
-        columns=["customer_state", "late_rate", "late_orders"],
-        rows=[{"customer_state": "AL", "late_rate": 0.24, "late_orders": 95}],
-        elapsed_ms=1.0,
-        row_count=1,
-        source="test",
-    )
-    answer = data_analyst.build_direct_answer_from_results("请分析消费者低分反馈背后是配送还是商品问题。", {"review_category": review, "delivery_by_state": delivery})
-    assert "差评风险最高品类" in answer
-    assert "物流延迟投诉" in answer
+    answer = data_analyst._fallback_direct_answer(primary)
+    assert "SP" in answer and "1 行" in answer
+    empty = QueryResult(columns=["customer_state"], rows=[], elapsed_ms=1.0, row_count=0, source="test")
+    assert data_analyst._fallback_direct_answer(empty)
 
 
 def test_primary_task_selection_follows_question_focus():
@@ -475,6 +455,7 @@ def test_map_question_adds_geo_supplement(monkeypatch):
     )
     monkeypatch.setattr(data_analyst, "run_query", lambda sql: geo_result if "mv_state_geo" in sql else state_result)
     monkeypatch.setattr(data_analyst, "decide_query_route", lambda sql: QueryRoute("materialized_view", ("mv_state_geo" if "mv_state_geo" in sql else "mv_state_sales",), "test"))
+    monkeypatch.setattr(data_analyst, "chat_completion", lambda *a, **k: SimpleNamespace(content="测试直答"))
     analysis = data_analyst.analyze_question("用巴西地图展示各州销售分布")
     assert "state_geo_map" in analysis.results
     assert {"customer_state", "lat", "lng"}.issubset(analysis.results["state_geo_map"].columns)
@@ -502,6 +483,7 @@ def test_prediction_question_adds_monthly_and_weekly_evidence(monkeypatch):
     )
     monkeypatch.setattr(data_analyst, "run_query", lambda sql: monthly_result if "mv_monthly_sales" in sql else weekly_result)
     monkeypatch.setattr(data_analyst, "decide_query_route", lambda sql: QueryRoute("materialized_view", ("mv_monthly_sales" if "mv_monthly_sales" in sql else "mv_weekly_sales",), "test"))
+    monkeypatch.setattr(data_analyst, "chat_completion", lambda *a, **k: SimpleNamespace(content="测试直答"))
     analysis = data_analyst.analyze_question("预测未来6周销售额")
     assert "monthly_sales" in analysis.results
     assert any({"week_start", "total_gmv"}.issubset(result.columns) for result in analysis.results.values())

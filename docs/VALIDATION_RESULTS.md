@@ -44,7 +44,14 @@ python cli.py --validate-general
 
 ## 重要说明
 
-这些问题不是业务逻辑里的写死分支。运行时由 Qwen 根据数据字典实时生成 SQL 任务，代码只做只读 SQL 校验、执行和通用字段识别。若模型不可用、SQL 非法或数据缺失，系统会明确报错。
+这些问题不是业务逻辑里的写死分支。运行时由 Qwen 根据数据字典实时生成 SQL 任务，并由 Qwen 解读真实查询结果生成业务直答；代码只做只读 SQL 校验、执行、确定性证据视图取数（地图经纬度、预测周序列等）和通用字段识别。若模型不可用、SQL 非法或数据缺失，系统会明确报错。
+
+## 2026-06-04 直答合成 Agent 化
+
+- DataAnalyst 由"只生成 SQL"升级为"生成 SQL + 解读结果"的真正分析 Agent：执行完查询后，由 Qwen 依据真实结果摘要合成 1–2 句业务直答（`synthesize_direct_answer`），取代了过去约 285 行按字段别名猜测拼装答案的 `build_direct_answer_from_results` 写死分支。
+- 大模型直答不可用时退回确定性兜底（`_fallback_direct_answer`），只陈述真实返回的数据规模与首行关键字段，不编造结论，保证 `has_direct_answer` 验收稳定。
+- `SUPPLEMENTAL_TASKS` 证据视图模板（地图/预测/各维度 `mv_*` 取数）作为合理的少量确定性逻辑保留，仅负责机械取数与可视化证据补充，不参与答案文本生成。
+- 离线单元验收：`python -m pytest -q tests/test_skeleton.py` 全部 32 项通过（新增 `synthesize_direct_answer` 接地上下文与确定性兜底两项测试，移除 3 项过时的写死直答断言）。
 
 ## 泛化验收
 

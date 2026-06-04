@@ -312,328 +312,36 @@ def draft_sql(question: str) -> AnalysisDraft:
     return AnalysisDraft(sql=sql, route=decide_query_route(sql), schema_context=render_schema_context())
 
 
-def _percent(value: object) -> str:
-    try:
-        return f"{float(value) * 100:.2f}%"
-    except (TypeError, ValueError):
-        return "未知"
+DIRECT_ANSWER_SYSTEM_PROMPT = (
+    "你是电商运营数据分析 Agent。请根据给定的真实查询结果，用简体中文直接回答用户的业务问题。"
+    "只能引用提供的数字和结论，禁止编造任何数据；证据不足时如实说明。"
+)
 
 
-def _first_value(row: dict[str, Any], *names: str) -> Any:
-    """Return the first present value from common LLM-generated aliases."""
-    for name in names:
-        if name in row:
-            return row.get(name)
-    return None
+def synthesize_direct_answer(question: str, summary: str, primary: QueryResult) -> str:
+    """让 DataAnalyst 依据真实查询结果，用大模型归纳一句话业务直答。
 
-
-def build_direct_answer(question: str, rows: list[dict[str, Any]]) -> str:
-    """Answer common business questions directly before asking the LLM for advice."""
-    text = question.lower()
-    if rows and any(keyword in text for keyword in ("配送", "delivery", "延迟", "late", "准时")):
-        overall = next((row for row in rows if row.get("customer_state") == "ALL"), None)
-        states = [row for row in rows if row.get("customer_state") != "ALL"]
-        worst = states[:5]
-        overall_part = (
-            f"平台整体准时交付率为 {_percent(overall.get('on_time_rate'))}，"
-            f"延迟率为 {_percent(overall.get('late_rate'))}，"
-            f"平均配送时长约 {overall.get('avg_delivery_days')} 天。"
-            if overall
-            else "平台整体准时率暂无可用汇总。"
-        )
-        worst_part = "延迟最严重的州：" + "；".join(
-            f"{row.get('customer_state')} 延迟率 {_percent(row.get('late_rate'))}，延迟订单 {row.get('late_orders')} 单，平均 {row.get('avg_delivery_days')} 天"
-            for row in worst
-        )
-        return f"{overall_part} {worst_part}"
-    return ""
-
-
-def build_direct_answer_from_results(question: str, results: dict[str, QueryResult]) -> str:
-    """Build a data-grounded direct answer for required verification questions."""
-    text = question.lower()
-    all_results = list(results.values())
-    is_strategy = any(keyword in text for keyword in ("策略", "建议", "方案", "降低", "改进", "3个月", "三大"))
-    is_delivery_focus = any(keyword in text for keyword in ("配送", "交付", "延迟", "准时", "物流", "履约", "风险热区", "delivery", "late", "on time", "on-time"))
-    on_time_result = results.get("delivery_overall") or next(
-        (
-            result
-            for result in all_results
-            if "overall_on_time_rate" in result.columns or ("on_time_rate" in result.columns and "customer_state" not in result.columns)
-        ),
-        None,
+    这取代了过去数百行写死的 if-else：把结构化结果翻译成自然语言结论本就是大模型的强项，
+    代码层不再逐字段猜测拼装答案。
+    """
+    prompt = (
+        f"用户问题：{question}\n\n"
+        f"真实查询结果摘要：\n{summary}\n\n"
+        f"主结果前几行：{primary.rows[:5]}\n\n"
+        "请用1到2句话直接回答这个问题，像业务汇报一样给出关键数字和结论，"
+        "不要罗列字段名，不要展开成多条建议。"
     )
-    late_state_result = results.get("delivery_by_state") or next((result for result in all_results if {"customer_state", "late_rate"}.issubset(result.columns)), None)
-    payment_result = results.get("payment_summary") or next(
-        (
-            result
-            for result in all_results
-            if "payment_type" in result.columns
-            and "payment_installments" not in result.columns
-            and any(column in result.columns for column in ("payment_count", "total_transactions", "transaction_count", "total_orders", "total_count", "count"))
-        ),
-        None,
-    )
-    avg_installment_result = next((result for result in all_results if {"payment_type", "avg_installments"}.issubset(result.columns)), None)
-    monthly_result = results.get("monthly_sales_2017") or results.get("monthly_sales") or next((result for result in all_results if {"year_month", "total_gmv"}.issubset(result.columns)), None)
-    state_sales_result = results.get("state_sales_2017") or results.get("state_sales") or next((result for result in all_results if "customer_state" in result.columns and any(column in result.columns for column in ("total_gmv", "total_sales", "total_orders", "avg_order_value"))), None)
-    weekly_result = next((result for result in all_results if {"week_start", "total_gmv"}.issubset(result.columns)), None)
-    category_result = results.get("category_sales") or next((result for result in all_results if "product_category_name" in result.columns and any(column in result.columns for column in ("total_gmv", "total_sales", "total_orders", "avg_order_value"))), None)
-    review_result = results.get("review_category") or next((result for result in all_results if "product_category_name" in result.columns and any(column in result.columns for column in ("negative_rate", "bad_review_rate", "negative_reviews", "delay_complaints", "quality_complaints"))), None)
-    seller_result = results.get("seller_review") or next((result for result in all_results if "seller_id" in result.columns and any(column in result.columns for column in ("avg_review_score", "negative_rate"))), None)
-    delivery_duration_result = results.get("delivery_by_state") or next((result for result in all_results if "customer_state" in result.columns and any(column in result.columns for column in ("avg_delivery_days", "state_avg_days"))), None)
-    weight_result = next((result for result in all_results if any(column in result.columns for column in ("avg_weight_g", "product_weight_g")) and any(column in result.columns for column in ("avg_freight", "freight_value"))), None)
+    response = chat_completion(DIRECT_ANSWER_SYSTEM_PROMPT, prompt, max_tokens=240)
+    return response.content.strip()
 
-    is_payment_focus = any(keyword in text for keyword in ("支付", "分期", "payment", "installment", "boleto", "credit"))
-    is_review_focus = any(keyword in text for keyword in ("差评", "评分", "评价", "评论", "低分", "反馈", "review", "negative"))
-    is_seller_focus = any(keyword in text for keyword in ("卖家", "seller"))
-    is_weight_focus = any(keyword in text for keyword in ("重量", "尺寸", "体积", "运费", "运力成本", "weight", "freight"))
-    is_category_focus = any(keyword in text for keyword in ("品类", "产品组", "category", "health_beauty"))
-    is_forecast_focus = any(keyword in text for keyword in ("预测", "未来6周", "未来六周", "区间", "forecast"))
 
-    if is_strategy:
-        return "已基于真实查询结果综合销售、配送、评价、卖家和商品维度，三个月内应优先处理高延迟地区、低评分卖家/品类和影响体验的履约问题；具体执行建议见下方大模型建议。"
-    if is_forecast_focus and weekly_result and weekly_result.rows:
-        return f"已基于 {len(weekly_result.rows)} 周真实GMV序列生成未来6周预测，预测值、上下界区间和误差诊断见预测图表。"
-    if state_sales_result and state_sales_result.rows and payment_result and (late_state_result or delivery_duration_result) and "州" in text:
-        top_state = state_sales_result.rows[0]
-        state = top_state.get("customer_state")
-        delivery_row: dict[str, Any] = {}
-        if delivery_duration_result:
-            delivery_row = next((row for row in delivery_duration_result.rows if row.get("customer_state") == state), {})
-        if not delivery_row and late_state_result:
-            delivery_row = next((row for row in late_state_result.rows if row.get("customer_state") == state), {})
-        payment_row = payment_result.rows[0] if payment_result and payment_result.rows else {}
-        on_time_rate = _first_value(delivery_row, "on_time_rate")
-        late_rate = _first_value(delivery_row, "late_rate")
-        if on_time_rate is None and late_rate is not None:
-            try:
-                on_time_rate = 1 - float(late_rate)
-            except (TypeError, ValueError):
-                on_time_rate = None
-        return (
-            f"销售额最高的州是 {state}，GMV约 {float(_first_value(top_state, 'total_gmv', 'total_sales') or 0):,.2f}；"
-            f"该州准时交付率为 {_percent(on_time_rate)}；"
-            f"最受欢迎支付方式是 {payment_row.get('payment_type', '见SQL结果')}。"
-        )
-    if is_payment_focus and payment_result and payment_result.rows:
-        top = payment_result.rows[0]
-        count = _first_value(top, "payment_count", "total_transactions", "transaction_count", "total_orders", "total_count", "count")
-        avg = _first_value(top, "avg_installments", "average_installments", "avg_payment_installments")
-        if avg is None and avg_installment_result:
-            avg_row = next((row for row in avg_installment_result.rows if row.get("payment_type") == top.get("payment_type")), avg_installment_result.rows[0] if avg_installment_result.rows else {})
-            avg = _first_value(avg_row, "avg_installments", "average_installments", "avg_payment_installments")
-        return f"支付分布显示最主要方式是 {top.get('payment_type')}，交易数 {count}；平均分期数约 {avg if avg is not None else '见SQL结果'}，高分期和金额差异见热力图/SQL证据。"
-    if is_seller_focus and seller_result and seller_result.rows:
-        seller = seller_result.rows[0]
-        state = seller.get("seller_state", seller.get("customer_state", "见SQL结果"))
-        score = _first_value(seller, "avg_review_score")
-        negative_rate = _first_value(seller, "negative_rate")
-        metric = f"差评率 {_percent(negative_rate)}" if negative_rate is not None else f"平均评分 {score}"
-        return f"需优先关注卖家 {seller.get('seller_id', '见SQL结果')}（州 {state}），其{metric}，订单数 {seller.get('total_orders', '见SQL结果')}。"
-    if is_review_focus and review_result and review_result.rows:
-        top = review_result.rows[0]
-        delay_total = sum(int(_first_value(row, "delay_complaints") or 0) for row in review_result.rows)
-        quality_total = sum(int(_first_value(row, "quality_complaints") or 0) for row in review_result.rows)
-        reason_hint = f"整体看物流延迟投诉 {delay_total} 次、质量投诉 {quality_total} 次；" if delay_total or quality_total else ""
-        negative_rate = _first_value(top, "negative_rate", "bad_review_rate")
-        negative_reviews = _first_value(top, "negative_reviews", "bad_reviews", "low_score_reviews")
-        return f"{reason_hint}差评风险最高品类为 {top.get('product_category_name')}，差评率 {_percent(negative_rate)}，差评数 {negative_reviews}。"
-    if is_weight_focus and weight_result and weight_result.rows:
-        top = weight_result.rows[0]
-        return (
-            f"已按重量/体积分组返回运费证据；样本中 {top.get('weight_bucket', '相关分组')} "
-            f"平均重量约 {_first_value(top, 'avg_weight_g', 'product_weight_g') or '见SQL结果'}g，"
-            f"平均运费约 {_first_value(top, 'avg_freight', 'freight_value') or '见SQL结果'}。"
-        )
-    if is_category_focus and category_result and category_result.rows:
-        top = category_result.rows[0]
-        review_row = review_result.rows[0] if review_result and review_result.rows else {}
-        total_gmv = float(_first_value(top, "total_gmv", "total_sales") or 0)
-        extra = f"；评分/差评证据显示 {review_row.get('product_category_name')} 差评率 {_percent(_first_value(review_row, 'negative_rate', 'bad_review_rate'))}" if review_row else ""
-        return f"品类表现最高的是 {top.get('product_category_name')}，GMV约 {total_gmv:,.2f}，订单数 {top.get('total_orders', '见SQL结果')}{extra}。"
-    if is_delivery_focus and (on_time_result or late_state_result) and not payment_result and not seller_result:
-        overall = on_time_result.rows[0] if on_time_result and on_time_result.rows else {}
-        states = late_state_result.rows[:5] if late_state_result else []
-        state_part = "；".join(
-            f"{row.get('customer_state')} 延迟率{_percent(row.get('late_rate'))}，延迟订单{row.get('late_orders', '见SQL结果')}"
-            for row in states
-        )
-        on_time_rate = overall.get("overall_on_time_rate", overall.get("on_time_rate"))
-        late_rate = overall.get("overall_late_rate")
-        if late_rate is None and on_time_rate is not None:
-            try:
-                late_rate = 1 - float(on_time_rate)
-            except (TypeError, ValueError):
-                late_rate = None
-        prefix = f"平台整体准时交付率为 {_percent(on_time_rate)}，延迟率为 {_percent(late_rate)}。" if overall else ""
-        return f"{prefix}物流风险较高的州：{state_part}。"
-    if state_sales_result and state_sales_result.rows and (payment_result or late_state_result or delivery_duration_result) and not seller_result:
-        top_state = state_sales_result.rows[0]
-        state = top_state.get("customer_state")
-        delivery_row: dict[str, Any] = {}
-        if delivery_duration_result:
-            delivery_row = next((row for row in delivery_duration_result.rows if row.get("customer_state") == state), {})
-        if not delivery_row and late_state_result:
-            delivery_row = next((row for row in late_state_result.rows if row.get("customer_state") == state), {})
-        if not delivery_row and on_time_result and on_time_result.rows:
-            delivery_row = on_time_result.rows[0]
-        payment_row = payment_result.rows[0] if payment_result and payment_result.rows else {}
-        on_time_rate = _first_value(delivery_row, "on_time_rate")
-        late_rate = _first_value(delivery_row, "late_rate")
-        if on_time_rate is None and late_rate is not None:
-            try:
-                on_time_rate = 1 - float(late_rate)
-            except (TypeError, ValueError):
-                on_time_rate = None
-        return (
-            f"销售额最高的州是 {state}，GMV约 {float(_first_value(top_state, 'total_gmv', 'total_sales') or 0):,.2f}；"
-            f"该州准时交付率为 {_percent(on_time_rate)}；"
-            f"最受欢迎支付方式是 {payment_row.get('payment_type', '见SQL结果')}。"
-        )
-    if delivery_duration_result and seller_result and delivery_duration_result.rows and seller_result.rows:
-        state = delivery_duration_result.rows[0]
-        seller = seller_result.rows[0]
-        seller_metric = _first_value(seller, "negative_rate", "avg_review_score")
-        metric_label = "差评率" if "negative_rate" in seller else "平均评分"
-        return (
-            f"平均配送时长或延迟率偏高的重点州包括 {state.get('customer_state')}，"
-            f"平均配送约 {float(_first_value(state, 'avg_delivery_days', 'state_avg_days') or 0):.2f} 天；"
-            f"需优先复核卖家 {seller.get('seller_id')}，其{metric_label}为 {seller_metric}。"
-        )
-    if on_time_result and on_time_result.rows:
-        overall = on_time_result.rows[0]
-        states = late_state_result.rows[:5] if late_state_result else []
-        state_part = "；".join(
-            f"{row.get('customer_state')} 延迟率 {_percent(row.get('late_rate'))}"
-            for row in states
-        )
-        on_time_rate = overall.get("overall_on_time_rate", overall.get("on_time_rate"))
-        late_rate = overall.get("overall_late_rate")
-        if late_rate is None:
-            try:
-                late_rate = 1 - float(on_time_rate)
-            except (TypeError, ValueError):
-                late_rate = None
-        return f"平台整体准时交付率为 {_percent(on_time_rate)}，延迟率为 {_percent(late_rate)}。延迟最严重州：{state_part}。"
-    if payment_result and payment_result.rows:
-        top = payment_result.rows[0]
-        count = _first_value(top, "payment_count", "total_transactions", "transaction_count", "total_orders", "total_count", "count")
-        avg = _first_value(top, "avg_installments", "average_installments", "avg_payment_installments")
-        if avg is None and avg_installment_result:
-            avg_row = next((row for row in avg_installment_result.rows if row.get("payment_type") == top.get("payment_type")), avg_installment_result.rows[0] if avg_installment_result.rows else {})
-            avg = _first_value(avg_row, "avg_installments", "average_installments", "avg_payment_installments")
-        return f"最受欢迎的支付方式是 {top.get('payment_type')}，交易数 {count}，平均分期数约 {avg if avg is not None else '见SQL结果'}。"
-    if monthly_result and monthly_result.rows:
-        total_gmv = sum(float(row.get("total_gmv") or 0) for row in monthly_result.rows)
-        state_part = ""
-        if state_sales_result and state_sales_result.rows:
-            top = state_sales_result.rows[0]
-            state_part = f"州排名第一为 {top.get('customer_state')}，GMV约 {float(_first_value(top, 'total_gmv', 'total_sales') or 0):,.2f}。"
-        return f"查询期GMV合计约 {total_gmv:,.2f}，已返回月度趋势。{state_part}"
-    if weekly_result and weekly_result.rows:
-        return f"已基于 {len(weekly_result.rows)} 周真实GMV序列生成未来6周预测，预测值和置信区间见预测图表。"
-    if state_sales_result and state_sales_result.rows:
-        value_key = "total_gmv" if any(_first_value(row, "total_gmv", "total_sales") is not None for row in state_sales_result.rows) else "total_orders"
-        sorted_rows = sorted(
-            state_sales_result.rows,
-            key=lambda row: float(_first_value(row, value_key, "total_sales") or 0),
-            reverse=True,
-        )
-        top = sorted_rows[0]
-        bottom = sorted_rows[-1] if len(sorted_rows) > 1 else {}
-        top_gmv = float(_first_value(top, "total_gmv", "total_sales") or 0)
-        if top_gmv:
-            answer = f"销售表现最高的州是 {top.get('customer_state')}，GMV约 {top_gmv:,.2f}，订单数 {top.get('total_orders', '见SQL结果')}。"
-        else:
-            answer = f"订单量最高的州是 {top.get('customer_state')}，订单数 {top.get('total_orders', '见SQL结果')}，客单价约 {_first_value(top, 'avg_order_value', 'avg_price') or '见SQL结果'}。"
-        if any(keyword in text for keyword in ("最低", "最差", "对比", "比较")) and bottom:
-            bottom_gmv = float(_first_value(bottom, "total_gmv", "total_sales") or 0)
-            if bottom_gmv:
-                answer += f" 对比样本中最低的是 {bottom.get('customer_state')}，GMV约 {bottom_gmv:,.2f}，可结合图表和SQL查看差距。"
-            else:
-                answer += f" 对比样本中最低的是 {bottom.get('customer_state')}，订单数 {bottom.get('total_orders', '见SQL结果')}，可结合图表和SQL查看差距。"
-        return answer
-    if review_result and review_result.rows:
-        top = review_result.rows[0]
-        negative_rate = _first_value(top, "negative_rate", "bad_review_rate")
-        negative_reviews = _first_value(top, "negative_reviews", "bad_reviews", "low_score_reviews")
-        reason_fields = {
-            "物流延迟": _first_value(top, "delay_complaints"),
-            "质量问题": _first_value(top, "quality_complaints"),
-            "错发/退换": _first_value(top, "wrong_item_complaints"),
-            "客服/沟通": _first_value(top, "service_complaints"),
-            "其他": _first_value(top, "other_complaints"),
-        }
-        ranked_reasons = sorted(
-            ((name, int(value)) for name, value in reason_fields.items() if value not in (None, "")),
-            key=lambda item: item[1],
-            reverse=True,
-        )
-        reason_text = "，主要原因：" + "、".join(f"{name}{value}次" for name, value in ranked_reasons[:3]) if ranked_reasons else ""
-        rate_text = f"差评率 {_percent(negative_rate)}，" if negative_rate is not None else ""
-        return f"差评风险最高品类为 {top.get('product_category_name')}，{rate_text}差评数 {negative_reviews}{reason_text}。"
-    if category_result and category_result.rows:
-        top = category_result.rows[0]
-        total_gmv = float(_first_value(top, "total_gmv", "total_sales") or 0)
-        avg_order_value = _first_value(top, "avg_order_value", "avg_price")
-        return (
-            f"品类表现最高的是 {top.get('product_category_name')}，GMV约 {total_gmv:,.2f}，"
-            f"订单数 {top.get('total_orders', '见SQL结果')}，客单价约 {avg_order_value if avg_order_value is not None else '见SQL结果'}。"
-        )
-    if weight_result and weight_result.rows:
-        return "已按重量区间与配送状态返回平均重量、体积、运费和订单量，可用于判断重量/尺寸与运费的关系。"
-    if "delivery_performance" in results:
-        answer = build_direct_answer(question, results["delivery_performance"].rows)
-        if answer:
-            return answer
-    if "monthly_sales_2017" in results and "state_sales_2017" in results:
-        months = results["monthly_sales_2017"].rows
-        states = results["state_sales_2017"].rows
-        total_gmv = sum(float(row.get("total_gmv") or 0) for row in months)
-        top_state = states[0] if states else {}
-        return (
-            f"2017年GMV合计约 {total_gmv:,.2f}，月度趋势已按12个月返回；"
-            f"州排名第一为 {top_state.get('customer_state')}，GMV约 {float(top_state.get('total_gmv') or 0):,.2f}。"
-        )
-    if "state_sales_2017" in results and "delivery_2017" in results and "payment_distribution" in results:
-        top_state = results["state_sales_2017"].rows[0] if results["state_sales_2017"].rows else {}
-        state = top_state.get("customer_state")
-        delivery = next((row for row in results["delivery_2017"].rows if row.get("customer_state") == state), {})
-        payment = results["payment_distribution"].rows[0] if results["payment_distribution"].rows else {}
-        return (
-            f"2017年销售额最高的州是 {state}，GMV约 {float(top_state.get('total_gmv') or 0):,.2f}；"
-            f"该州准时交付率为 {_percent(delivery.get('on_time_rate'))}；"
-            f"最受欢迎支付方式是 {payment.get('payment_type')}。"
-        )
-    if "payment_distribution" in results:
-        rows = results["payment_distribution"].rows
-        top = rows[0] if rows else {}
-        count = _first_value(top, "payment_count", "total_transactions", "transaction_count", "total_orders", "total_count", "count")
-        avg = _first_value(top, "avg_installments", "average_installments", "avg_payment_installments")
-        return f"最受欢迎的支付方式是 {top.get('payment_type')}，交易数 {count}；其平均分期数约 {avg if avg is not None else '未知'}。"
-    if "weight_freight" in results:
-        rows = results["weight_freight"].rows
-        return "重量和体积越大的分组平均运费通常越高；结果已按重量区间和配送状态返回，可用于气泡散点图查看订单量差异。" if rows else ""
-    if "review_category" in results:
-        top = results["review_category"].rows[0] if results["review_category"].rows else {}
-        return (
-            f"差评风险最高品类为 {top.get('product_category_name')}，"
-            f"差评率 {_percent(_first_value(top, 'negative_rate', 'bad_review_rate'))}，差评数 {_first_value(top, 'negative_reviews', 'bad_reviews', 'low_score_reviews')}。"
-        )
-    if "state_sales" in results:
-        top = results["state_sales"].rows[0] if results["state_sales"].rows else {}
-        return f"销售额最高的州为 {top.get('customer_state')}，GMV约 {float(top.get('total_gmv') or 0):,.2f}，订单数 {top.get('total_orders')}。"
-    if {"monthly_sales", "delivery_performance", "review_category"}.issubset(results):
-        delivery = results["delivery_performance"].rows[0] if results["delivery_performance"].rows else {}
-        review = results["review_category"].rows[0] if results["review_category"].rows else {}
-        return (
-            "平台三个月优先改进应聚焦三件事："
-            f"先治理 {delivery.get('customer_state')} 等高延迟州，"
-            f"再处理 {review.get('product_category_name')} 等高差评品类，"
-            "同时围绕主流支付方式优化结算与分期体验。"
-        )
-    return ""
+def _fallback_direct_answer(primary: QueryResult) -> str:
+    """大模型直答不可用时的确定性兜底：只陈述真实返回的数据，不编造结论。"""
+    if not primary.rows:
+        return "查询已执行，但当前条件下没有匹配数据。"
+    head = primary.rows[0]
+    fields = "，".join(f"{key}={head[key]}" for key in list(primary.columns)[:4])
+    return f"已基于真实查询返回 {len(primary.rows)} 行结果，首行关键数据：{fields}。"
 
 
 SUPPLEMENTAL_TASKS: dict[str, QueryTask] = {
@@ -1022,7 +730,14 @@ def analyze_question(question: str, plan_context: dict[str, Any] | None = None) 
         f"{task.purpose}：{summarize_rows(results[task.name].rows, results[task.name].columns)}"
         for task in summary_tasks
     ]
-    direct_answer = build_direct_answer_from_results(question, results)
+    summary_text = "\n".join(summaries)
+    # 由大模型解读真实查询结果生成业务直答；模型不可用时退回确定性数据兜底，避免整条分析失败。
+    try:
+        direct_answer = synthesize_direct_answer(question, summary_text, result)
+    except Exception:
+        direct_answer = ""
+    if not direct_answer:
+        direct_answer = _fallback_direct_answer(result)
     return DataAnalysis(
         question=question,
         sql=primary.sql,
@@ -1031,6 +746,6 @@ def analyze_question(question: str, plan_context: dict[str, Any] | None = None) 
         routes=routes,
         result=result,
         results=results,
-        summary="\n".join(summaries),
+        summary=summary_text,
         direct_answer=direct_answer,
     )
