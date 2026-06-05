@@ -71,7 +71,7 @@ MATERIALIZED_VIEWS = {
     },
     "mv_review_category_perf": {
         "grain": "product_category_name",
-        "purpose": "Category review score, negative review rate, and bad-review reason signals.",
+        "purpose": "品类评分、差评率与差评数量的快速汇总，以及物流/质量/错发/客服四类**可明确识别**的差评计数。注意：这四类关键词分类只能覆盖少数措辞明确的差评，**不可据此推断'主要差评原因'**——回答'差评原因/主要差评原因/为什么差评'必须使用 mv_review_topics（NMF 主题）。本视图仅用于差评量、差评率，以及对已识别的物流/质量/错发/客服做补充佐证。",
         "columns": [
             "product_category_name",
             "total_reviews",
@@ -82,12 +82,11 @@ MATERIALIZED_VIEWS = {
             "quality_complaints",
             "wrong_item_complaints",
             "service_complaints",
-            "other_complaints",
         ],
     },
     "mv_review_topics": {
         "grain": "product_category_name + topic_id ('ALL' 行为平台级)",
-        "purpose": "负面评论 TF-IDF+NMF 主题建模结果：每个品类的差评集中在哪些数据驱动主题（topic_label/topic_keywords 为葡语关键词），用于回答差评原因并支撑改进建议；优于关键词分类。",
+        "purpose": "负面评论 TF-IDF+NMF 主题建模结果：每个品类的差评集中在哪些数据驱动主题（topic_label/topic_keywords 为葡语关键词，topic_id='ALL' 为平台级）。**回答'差评原因/主要差评原因/为什么差评'时必须优先使用本视图，按 complaint_count 取该品类 Top 主题**，并把葡语 topic_label/keywords 翻译为中文业务原因（如 `comprei dois·recebi apenas`=漏发缺件、`entrega·prazo`=配送超期、`produto·qualidade`=质量差）；这是对 mv_review_category_perf 关键词分类的升级替代，结论更可信。",
         "columns": [
             "product_category_name",
             "topic_id",
