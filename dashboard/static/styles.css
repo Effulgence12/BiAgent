@@ -399,6 +399,14 @@ pre {
   display: none;
 }
 
+.whatif-block {
+  margin-top: 12px;
+}
+
+.whatif-block:empty {
+  display: none;
+}
+
 .forecast-block pre {
   min-height: 140px;
 }

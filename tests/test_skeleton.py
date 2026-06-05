@@ -729,3 +729,148 @@ def test_context_is_only_injected_for_followups():
     assert independent == "不同支付方式和分期数的订单分布热力图应该怎么看？"
     assert "最近对话上下文" in followup
     assert "请用地图展示各州销售额" in followup
+
+
+def test_detect_whatif_and_default_scenario():
+    from utils import whatif
+
+    assert whatif.detect_whatif("如果下架Top20差评卖家，平台评分会提升多少？")
+    assert whatif.detect_whatif("假设消除所有延迟订单，整体评分如何变化？")
+    assert not whatif.detect_whatif("2017年各月GMV趋势如何？")
+    assert whatif.default_scenario("如果消除配送延迟会怎样？")[0] == "resolve_late_deliveries"
+    assert whatif.default_scenario("下架差评卖家后评分变化")[0] == "delist_low_rating_sellers"
+    assert whatif.default_scenario("如果天气变好")[0] == ""
+
+
+def _seed_whatif_tables(conn):
+    """最小订单/评价基础表 + mv_seller_perf：good 卖家全 5 分且按时，bad 卖家全 1 分且延迟。"""
+    conn.executescript(
+        """
+        CREATE TABLE orders (order_id TEXT, order_status TEXT, order_delivered_customer_date TEXT, order_estimated_delivery_date TEXT);
+        CREATE TABLE order_items (order_id TEXT, seller_id TEXT);
+        CREATE TABLE order_reviews (review_id TEXT, order_id TEXT, review_score TEXT);
+        CREATE TABLE mv_seller_perf (seller_id TEXT, total_orders INTEGER, avg_review_score REAL);
+        """
+    )
+    plans = [("good", "5", "2018-01-01", "2018-01-05"), ("bad", "1", "2018-01-10", "2018-01-05")]
+    index = 0
+    for seller, score, delivered, estimated in plans:
+        for _ in range(3):
+            oid = f"o{index}"
+            conn.execute("INSERT INTO orders VALUES (?,?,?,?)", (oid, "delivered", delivered, estimated))
+            conn.execute("INSERT INTO order_items VALUES (?,?)", (oid, seller))
+            conn.execute("INSERT INTO order_reviews VALUES (?,?,?)", (f"r{index}", oid, score))
+            index += 1
+        conn.execute("INSERT INTO mv_seller_perf VALUES (?,?,?)", (seller, 3, float(score)))
+
+
+def _whatif_query_factory(conn):
+    def _run(sql, limit=200):
+        cursor = conn.execute(sql.strip().rstrip(";"))
+        rows = [dict(row) for row in cursor.fetchall()]
+        columns = [description[0] for description in cursor.description or []]
+        return QueryResult(columns=columns, rows=rows, elapsed_ms=0.0, row_count=len(rows), source="test")
+
+    return _run
+
+
+def test_run_whatif_delist_sellers_before_after(monkeypatch):
+    import sqlite3
+
+    from utils import whatif
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    _seed_whatif_tables(conn)
+    monkeypatch.setattr(whatif, "run_query", _whatif_query_factory(conn))
+    result = whatif.run_whatif("delist_low_rating_sellers", {"top_n": 1, "min_orders": 1})
+    assert result.baseline == 3.0  # (5*3 + 1*3) / 6
+    assert result.scenario == 5.0  # 剔除 bad 卖家后只剩 5 分订单
+    assert result.delta == 2.0
+    assert result.direction == "提升"
+    assert result.affected_count == 3
+    conn.close()
+
+
+def test_run_whatif_resolve_late_deliveries(monkeypatch):
+    import sqlite3
+
+    from utils import whatif
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    _seed_whatif_tables(conn)
+    monkeypatch.setattr(whatif, "run_query", _whatif_query_factory(conn))
+    result = whatif.run_whatif("resolve_late_deliveries")
+    assert result.baseline == 3.0
+    assert result.scenario == 5.0  # 延迟订单（bad，1分）被剔除
+    assert result.delta == 2.0
+    conn.close()
+
+
+def test_workflow_routes_through_whatif(monkeypatch):
+    from utils.whatif import WhatIfResult
+
+    query_result = QueryResult(
+        columns=["seller_id", "avg_review_score"],
+        rows=[{"seller_id": "s_bad", "avg_review_score": 1.2}],
+        elapsed_ms=1.0,
+        row_count=1,
+        source="test",
+    )
+    data_analysis = DataAnalysis(
+        question="如果下架评分最低的卖家，平台评分会提升多少？",
+        sql="SELECT * FROM mv_seller_perf LIMIT 1",
+        tasks=(QueryTask("seller_review", "SELECT * FROM mv_seller_perf LIMIT 1", "卖家评分"),),
+        route=QueryRoute("materialized_view", ("mv_seller_perf",), "test"),
+        routes={"seller_review": QueryRoute("materialized_view", ("mv_seller_perf",), "test")},
+        result=query_result,
+        results={"seller_review": query_result},
+        summary="测试摘要",
+        direct_answer="测试直答",
+    )
+    monkeypatch.setattr(orchestrator, "analyze_question", lambda question, plan_context=None: data_analysis)
+    monkeypatch.setattr(
+        orchestrator,
+        "build_plan",
+        lambda question: AnalysisPlan(
+            "prescriptive",
+            ("Orchestrator", "DataAnalyst", "Visualizer", "DecisionMaker"),
+            intent=question,
+            required_agents=("orchestrator", "data_analyst", "visualizer", "decision_maker"),
+            required_views=("mv_seller_perf",),
+        ),
+    )
+    monkeypatch.setattr(orchestrator, "_select_whatif", lambda question: ("delist_low_rating_sellers", {}))
+    monkeypatch.setattr(
+        orchestrator,
+        "run_whatif",
+        lambda scenario_id, params=None: WhatIfResult(
+            scenario_id="delist_low_rating_sellers",
+            scenario_label="下架评分最低的 20 个卖家",
+            metric_label="平台整体平均评分",
+            unit="分",
+            baseline=4.0,
+            scenario=4.1,
+            delta=0.1,
+            direction="提升",
+            params={"top_n": 20, "min_orders": 5},
+            affected_label="差评订单",
+            affected_count=500,
+            affected_share=0.05,
+            narrative="下架后评分从 4.0 提升到 4.1。",
+        ),
+    )
+    captured = {}
+
+    def fake_recommendations(*args, **kwargs):
+        captured["whatif_summary"] = kwargs.get("whatif_summary", "")
+        return ["建议一占位内容", "建议二占位内容", "建议三占位内容"]
+
+    monkeypatch.setattr(orchestrator, "build_recommendations", fake_recommendations)
+    workflow = run_workflow("如果下架评分最低的卖家，平台评分会提升多少？")
+    assert workflow.whatif is not None
+    assert workflow.whatif["scenario_id"] == "delist_low_rating_sellers"
+    assert workflow.whatif["delta"] == 0.1
+    assert "whatif_model" in workflow.plan.required_agents
+    assert captured["whatif_summary"] == "下架后评分从 4.0 提升到 4.1。"

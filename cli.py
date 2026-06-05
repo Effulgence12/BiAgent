@@ -125,6 +125,8 @@ def _workflow_payload(question: str) -> dict[str, object]:
         "has_forecast": bool(workflow.forecast),
         "forecast_has_interval": bool(workflow.forecast) and all({"yhat", "yhat_lower", "yhat_upper"}.issubset(item) for item in workflow.forecast),
         "forecast_diagnostics": workflow.forecast_diagnostics,
+        "has_whatif": bool(workflow.whatif and not workflow.whatif.get("error")),
+        "whatif": workflow.whatif,
         "direct_answer": workflow.data_analysis.direct_answer,
     }
 
@@ -230,6 +232,7 @@ def main() -> None:
         "rows_preview": workflow.data_analysis.result.rows[:5],
         "forecast": workflow.forecast,
         "forecast_diagnostics": workflow.forecast_diagnostics,
+        "whatif": workflow.whatif,
         "recommendations": workflow.recommendations,
     }
     print(json.dumps(payload, ensure_ascii=False, indent=2))

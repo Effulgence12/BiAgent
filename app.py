@@ -56,6 +56,7 @@ class AnalyzeResponse(BaseModel):
     elapsed_ms: float
     forecast: list[dict[str, float | str]]
     forecast_diagnostics: dict[str, Any]
+    whatif: dict[str, Any] | None
     recommendations: list[str]
     session_id: str
     planner_plan: dict[str, Any]
@@ -233,6 +234,7 @@ def analyze(payload: AnalyzeRequest) -> AnalyzeResponse:
         elapsed_ms=round(result.elapsed_ms, 2),
         forecast=workflow.forecast,
         forecast_diagnostics=workflow.forecast_diagnostics,
+        whatif=workflow.whatif,
         recommendations=workflow.recommendations,
         planner_plan=workflow.plan.to_context(),
     )
@@ -355,12 +357,18 @@ async def analyze_ws(websocket: WebSocket) -> None:
     await websocket.send_json({"event": "agent_start", "agent": "visualizer"})
     await websocket.send_json({"event": "chart_done", "chart_type": workflow.chart_type, "chart_html": workflow.chart_html, "charts": workflow.charts})
     await websocket.send_json({"event": "agent_done", "agent": "visualizer"})
+    if workflow.whatif:
+        await websocket.send_json({"event": "agent_start", "agent": "whatif_model"})
+        await websocket.send_json({"event": "whatif", "whatif": workflow.whatif})
+        await websocket.send_json({"event": "agent_done", "agent": "whatif_model"})
+    whatif_summary = str((workflow.whatif or {}).get("narrative") or "") if workflow.whatif and not workflow.whatif.get("error") else ""
     stream_prompt = build_recommendation_prompt(
         workflow.plan.analysis_type,
         workflow.data_analysis.summary,
         question=question,
         direct_answer=workflow.data_analysis.direct_answer,
         rows=workflow.data_analysis.result.rows,
+        whatif_summary=whatif_summary,
     )
     streamed = False
     llm_error = ""
@@ -391,6 +399,7 @@ async def analyze_ws(websocket: WebSocket) -> None:
             "streamed_llm": streamed,
             "forecast": workflow.forecast,
             "forecast_diagnostics": workflow.forecast_diagnostics,
+            "whatif": workflow.whatif,
             "recommendations": [],
             "session_id": session_id,
             "request_id": request_id,
