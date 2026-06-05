@@ -26,6 +26,9 @@ BASE_TABLES = {
     "products": [
         "product_id",
         "product_category_name",
+        "product_name_length",
+        "product_description_length",
+        "product_photos_qty",
         "product_weight_g",
         "product_length_cm",
         "product_height_cm",
@@ -33,7 +36,15 @@ BASE_TABLES = {
     ],
     "sellers": ["seller_id", "seller_city", "seller_state"],
     "order_payments": ["order_id", "payment_type", "payment_installments", "payment_value"],
-    "order_reviews": ["review_id", "order_id", "review_score", "review_comment_message"],
+    "order_reviews": [
+        "review_id",
+        "order_id",
+        "review_score",
+        "review_comment_title",
+        "review_comment_message",
+        "review_creation_date",
+        "review_answer_timestamp",
+    ],
 }
 
 

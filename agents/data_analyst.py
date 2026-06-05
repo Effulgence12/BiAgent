@@ -9,6 +9,7 @@ from statistics import mean
 from typing import Any
 
 from config.prompts import DATA_ANALYST_SYSTEM_PROMPT
+from config.settings import settings
 from utils.llm_client import chat_completion
 from utils.local_store import QueryResult, run_query
 from utils.query_router import QueryRoute, decide_query_route
@@ -179,6 +180,17 @@ def plan_tasks_with_llm(question: str, plan_context: dict[str, Any] | None = Non
     让前端真实展示问题，而不是用写死 SQL 制造完成假象。
     """
     allowed_base_tables = ", ".join(sorted(BASE_TABLES))
+    sql_dialect = "MySQL" if settings.prefer_mysql else "SQLite"
+    date_guidance = (
+        "时间使用 DATE_FORMAT(timestamp, '%Y-%m')、DATE()、TIMESTAMPDIFF；不要使用 strftime、julianday。"
+        if settings.prefer_mysql
+        else "时间使用 substr(timestamp, 1, 7) 或 date/strftime；百分比字段返回 0-1 小数。"
+    )
+    forbidden_dialect = (
+        "不要使用 PERCENTILE_CONT、WITHIN GROUP、DATE_TRUNC、INTERVAL 字面量等非 MySQL 兼容写法。"
+        if settings.prefer_mysql
+        else "不要使用 PERCENTILE_CONT、WITHIN GROUP、DATE_TRUNC、INTERVAL 等非 SQLite 语法；需要分位数时请用 ORDER BY + LIMIT/OFFSET 近似。"
+    )
     prompt = f"""
 用户问题：
 {question}
@@ -189,12 +201,13 @@ def plan_tasks_with_llm(question: str, plan_context: dict[str, Any] | None = Non
 规划要求：
 1. 你是数据分析 Agent，需要把问题拆成 1 到 6 个 SQL 任务。
 2. 优先使用 mv_* 预聚合表；只有视图不能覆盖时才 JOIN 基础表。
-3. 所有 SQL 必须是 SQLite 兼容的只读 SELECT 或 WITH 查询。
-4. 时间使用 substr(timestamp, 1, 7) 或 date/strftime；百分比字段返回 0-1 小数。
+3. 所有 SQL 必须是 {sql_dialect} 兼容的只读 SELECT 或 WITH 查询。
+4. {date_guidance}
 5. 需要预测未来6周时，请至少返回 mv_weekly_sales 的 week_start,total_gmv 序列。
-6. 地图/地域问题优先使用 mv_state_geo；差评原因优先使用 mv_review_category_perf；重量运费优先使用 mv_weight_freight。
-7. 基础表只允许这些：{allowed_base_tables}。
-8. 不要使用 PERCENTILE_CONT、WITHIN GROUP、DATE_TRUNC、INTERVAL 等非 SQLite 语法；需要分位数时请用 ORDER BY + LIMIT/OFFSET 近似。
+6. Olist 是 2016-09 到 2018-10 的静态历史数据；除非用户明确要求当前时间，否则不要使用 CURDATE()/NOW()/最近12个月过滤。
+7. 地图/地域问题优先使用 mv_state_geo；差评原因优先使用 mv_review_category_perf；卖家差评率优先使用 mv_seller_perf.negative_rate；重量运费优先使用 mv_weight_freight。
+8. 基础表只允许这些：{allowed_base_tables}。
+9. {forbidden_dialect}
 
 只返回 JSON，不要 Markdown。格式：
 {{
@@ -232,6 +245,12 @@ def plan_tasks_with_llm(question: str, plan_context: dict[str, Any] | None = Non
 
 def repair_tasks_with_llm(question: str, failed_tasks: tuple[QueryTask, ...], error: str, plan_context: dict[str, Any] | None = None) -> tuple[QueryTask, ...]:
     """Ask the remote LLM to repair invalid SQL once execution exposes an error."""
+    sql_dialect = "MySQL" if settings.prefer_mysql else "SQLite"
+    forbidden_dialect = (
+        "不要使用 PERCENTILE_CONT、WITHIN GROUP、DATE_TRUNC、INTERVAL 字面量等非 MySQL 兼容写法。"
+        if settings.prefer_mysql
+        else "不要使用 PERCENTILE_CONT、WITHIN GROUP、DATE_TRUNC、INTERVAL 等非 SQLite 语法；需要分位数时请用 ORDER BY + LIMIT/OFFSET 近似。"
+    )
     prompt = f"""
 用户问题：
 {question}
@@ -248,9 +267,11 @@ def repair_tasks_with_llm(question: str, failed_tasks: tuple[QueryTask, ...], er
 请修复 SQL。要求：
 1. 仍然拆成 1 到 6 个 SQL 任务。
 2. 优先使用 mv_* 预聚合表。
-3. 所有 SQL 必须是 SQLite 兼容的只读 SELECT 或 WITH。
+3. 所有 SQL 必须是 {sql_dialect} 兼容的只读 SELECT 或 WITH。
 4. 不要引用不存在的表别名或字段。
-5. 不要使用 PERCENTILE_CONT、WITHIN GROUP、DATE_TRUNC、INTERVAL 等非 SQLite 语法；需要分位数时请用 ORDER BY + LIMIT/OFFSET 近似。
+5. Olist 是 2016-09 到 2018-10 的静态历史数据；除非用户明确要求当前时间，否则不要使用 CURDATE()/NOW()/最近12个月过滤。
+6. 卖家差评率问题优先使用 mv_seller_perf.negative_rate。
+7. {forbidden_dialect}
 
 只返回 JSON，不要 Markdown。格式：
 {{
@@ -451,6 +472,11 @@ SUPPLEMENTAL_TASKS: dict[str, QueryTask] = {
         "SELECT customer_state, SUM(total_orders) AS total_orders, ROUND(SUM(avg_delivery_days * total_orders) / NULLIF(SUM(total_orders), 0), 2) AS avg_delivery_days, SUM(late_orders) AS late_orders, ROUND(1.0 * SUM(late_orders) / NULLIF(SUM(total_orders), 0), 4) AS late_rate, ROUND(1.0 - 1.0 * SUM(late_orders) / NULLIF(SUM(total_orders), 0), 4) AS on_time_rate FROM mv_delivery_perf GROUP BY customer_state ORDER BY late_rate DESC, total_orders DESC LIMIT 27",
         "各州配送延迟率和准时率对比",
     ),
+    "delivery_duration_by_state": QueryTask(
+        "delivery_duration_by_state",
+        "SELECT customer_state, SUM(total_orders) AS total_orders, ROUND(SUM(avg_delivery_days * total_orders) / NULLIF(SUM(total_orders), 0), 2) AS avg_delivery_days, SUM(late_orders) AS late_orders, ROUND(1.0 * SUM(late_orders) / NULLIF(SUM(total_orders), 0), 4) AS late_rate, ROUND(1.0 - 1.0 * SUM(late_orders) / NULLIF(SUM(total_orders), 0), 4) AS on_time_rate FROM mv_delivery_perf GROUP BY customer_state ORDER BY avg_delivery_days DESC, total_orders DESC LIMIT 27",
+        "各州平均配送时长与全国均值对比",
+    ),
     "payment_summary": QueryTask(
         "payment_summary",
         "SELECT payment_type, SUM(payment_count) AS payment_count, ROUND(SUM(payment_value), 2) AS payment_value, ROUND(SUM(payment_installments * payment_count) / NULLIF(SUM(payment_count), 0), 2) AS avg_installments FROM mv_payment_dist GROUP BY payment_type ORDER BY payment_count DESC LIMIT 10",
@@ -483,8 +509,8 @@ SUPPLEMENTAL_TASKS: dict[str, QueryTask] = {
     ),
     "seller_review": QueryTask(
         "seller_review",
-        "SELECT seller_id, seller_state, SUM(total_orders) AS total_orders, ROUND(SUM(total_gmv), 2) AS total_gmv, ROUND(AVG(avg_review_score), 2) AS avg_review_score FROM mv_seller_perf GROUP BY seller_id, seller_state HAVING total_orders >= 3 ORDER BY avg_review_score ASC, total_orders DESC LIMIT 20",
-        "低评分卖家定位和卖家绩效诊断",
+        "SELECT seller_id, seller_state, SUM(total_orders) AS total_orders, ROUND(SUM(total_gmv), 2) AS total_gmv, SUM(total_reviews) AS total_reviews, SUM(negative_reviews) AS negative_reviews, ROUND(1.0 * SUM(negative_reviews) / NULLIF(SUM(total_reviews), 0), 4) AS negative_rate, ROUND(AVG(avg_review_score), 2) AS avg_review_score FROM mv_seller_perf GROUP BY seller_id, seller_state HAVING total_reviews >= 3 ORDER BY negative_rate DESC, total_reviews DESC, avg_review_score ASC LIMIT 20",
+        "差评率最高卖家定位和卖家绩效诊断",
     ),
     "seller_geo_map": QueryTask(
         "seller_geo_map",
@@ -503,12 +529,13 @@ SUPPLEMENTAL_TASKS: dict[str, QueryTask] = {
             seller_state AS customer_state,
             SUM(total_orders) AS total_orders,
             ROUND(SUM(total_gmv), 2) AS total_gmv,
+            ROUND(1.0 * SUM(negative_reviews) / NULLIF(SUM(total_reviews), 0), 4) AS negative_rate,
             ROUND(AVG(avg_review_score), 2) AS avg_review_score
           FROM mv_seller_perf
           GROUP BY seller_state
         ) s ON g.customer_state = s.customer_state
         WHERE g.lat IS NOT NULL AND g.lng IS NOT NULL
-        ORDER BY s.avg_review_score ASC, s.total_orders DESC
+        ORDER BY s.negative_rate DESC, s.total_orders DESC
         LIMIT 27
         """,
         "地图可视化所需的州级经纬度与卖家评分风险指标",
@@ -624,6 +651,9 @@ def _supplement_tasks(question: str, tasks: tuple[QueryTask, ...], plan_context:
     if any(keyword in text for keyword in ("准时", "延迟", "配送", "交付", "delivery")):
         tasks = _append_task(tasks, "delivery_overall")
         tasks = _append_task(tasks, "delivery_by_state")
+    if any(keyword in text for keyword in ("平均配送时长", "配送时长", "平均 delivery", "avg_delivery_days")):
+        tasks = _append_task(tasks, "delivery_overall")
+        tasks = _append_task(tasks, "delivery_duration_by_state")
     if any(keyword in text for keyword in ("支付", "分期", "payment", "installment")):
         tasks = _append_task(tasks, "payment_summary")
         tasks = _append_task(tasks, "payment_heatmap")
@@ -683,18 +713,25 @@ def _select_primary_task(question: str, tasks: tuple[QueryTask, ...], results: d
     """Select the evidence task that best matches the user's current question."""
     text = question.lower()
     preferred_names: list[str] = []
+    seller_focus = any(keyword in text for keyword in ("卖家", "seller"))
+    review_focus = any(keyword in text for keyword in ("差评", "评分", "评价", "评论", "低分", "反馈", "review", "negative"))
+    delivery_focus = any(keyword in text for keyword in ("配送", "交付", "延迟", "准时", "物流", "履约", "delivery", "late"))
+    if seller_focus and review_focus:
+        preferred_names.append("seller_review")
+    if delivery_focus and not seller_focus:
+        preferred_names.extend(["delivery_duration_by_state", "delivery_by_state", "delivery_overall", "delivery_geo_map", "on_time_geo_map"])
     if any(keyword in text for keyword in ("支付", "分期", "payment", "installment", "boleto", "credit")):
         preferred_names.extend(["payment_summary", "payment_heatmap"])
-    if any(keyword in text for keyword in ("差评", "评分", "评价", "评论", "低分", "反馈", "review", "negative")):
+    if review_focus and not seller_focus:
         preferred_names.append("review_category")
-    if any(keyword in text for keyword in ("卖家", "seller")):
+    if seller_focus:
         preferred_names.append("seller_review")
     if any(keyword in text for keyword in ("重量", "尺寸", "体积", "运费", "运力成本", "weight", "freight")):
         preferred_names.append("weight_freight")
     if any(keyword in text for keyword in ("预测", "未来6周", "未来六周", "区间", "forecast")):
         preferred_names.extend(["weekly_sales", "monthly_sales"])
-    if any(keyword in text for keyword in ("配送", "交付", "延迟", "准时", "物流", "履约", "delivery", "late")):
-        preferred_names.extend(["delivery_by_state", "delivery_overall", "delivery_geo_map", "on_time_geo_map"])
+    if delivery_focus:
+        preferred_names.extend(["delivery_duration_by_state", "delivery_by_state", "delivery_overall", "delivery_geo_map", "on_time_geo_map"])
     if any(keyword in text for keyword in ("品类", "产品组", "category", "health_beauty")):
         preferred_names.append("category_sales")
     if any(keyword in text for keyword in ("地图", "地理", "geo", "map", "巴西", "州级", "州分布")):
@@ -705,6 +742,37 @@ def _select_primary_task(question: str, tasks: tuple[QueryTask, ...], results: d
                 if task.name in results:
                     return task
     return next((task for task in tasks if task.name in results), tasks[0])
+
+
+def _ordered_summary_tasks(question: str, primary: QueryTask, tasks: tuple[QueryTask, ...]) -> tuple[QueryTask, ...]:
+    """Put canonical supplemental evidence before noisier free-form LLM tasks."""
+    text = question.lower()
+    seller_focus = any(keyword in text for keyword in ("卖家", "seller"))
+    delivery_focus = any(keyword in text for keyword in ("配送", "交付", "延迟", "准时", "物流", "履约", "delivery", "late"))
+    review_focus = any(keyword in text for keyword in ("差评", "评分", "评价", "评论", "低分", "反馈", "review", "negative"))
+    priority: list[str] = [primary.name]
+    if seller_focus:
+        priority.append("seller_review")
+    if delivery_focus:
+        priority.extend(["delivery_overall", "delivery_duration_by_state", "delivery_by_state", "delivery_geo_map", "on_time_geo_map"])
+    if review_focus:
+        priority.extend(["review_category", "review_topics_by_category"])
+
+    ordered: list[QueryTask] = []
+    seen: set[str] = set()
+    for name in priority:
+        for task in tasks:
+            if task.name == name and task.name not in seen:
+                ordered.append(task)
+                seen.add(task.name)
+    canonical_coverage = seller_focus or delivery_focus or review_focus
+    for task in tasks:
+        if task.name not in seen:
+            if canonical_coverage and task.name not in SUPPLEMENTAL_TASKS:
+                continue
+            ordered.append(task)
+            seen.add(task.name)
+    return tuple(ordered)
 
 
 def analyze_question(question: str, plan_context: dict[str, Any] | None = None) -> DataAnalysis:
@@ -739,7 +807,7 @@ def analyze_question(question: str, plan_context: dict[str, Any] | None = None) 
     primary = _select_primary_task(question, tasks, results)
     result = results[primary.name]
     route = routes[primary.name]
-    summary_tasks = (primary, *(task for task in tasks if task.name != primary.name))
+    summary_tasks = _ordered_summary_tasks(question, primary, tasks)
     summaries = [
         f"{task.purpose}：{summarize_rows(results[task.name].rows, results[task.name].columns)}"
         for task in summary_tasks

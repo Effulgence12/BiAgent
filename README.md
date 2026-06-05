@@ -9,7 +9,7 @@
 核心能力：
 
 - 自然语言问题解析与多 Agent 协作编排。
-- MySQL 生产 SQL 与当前阶段 SQLite 本地查询双路径；SQLite 只作为临时查询引擎，数据必须来自真实 Olist CSV，Agent 查询优先命中 `mv_*` 预聚合表。
+- MySQL 正式查询引擎与 SQLite 本地兜底双路径；数据必须来自真实 Olist CSV，Agent 查询优先命中 `mv_*` 预聚合表。
 - 描述性、诊断性、预测性、规范性四层分析。
 - Web 双栏界面：左侧对话，右侧 SQL、图表、建议与 JSON。
 - 必须配置可用 Qwen/DashScope API Key；模型不可用时接口返回明确错误，不生成本地假建议。
@@ -18,7 +18,7 @@
 
 - `app.py`：FastAPI 入口，包含健康检查、数据初始化、同步分析接口与 WebSocket 流式接口。
 - `agents/`：LangGraph 编排的 Orchestrator、DataAnalyst、ForecastModel、Visualizer、DecisionMaker 可运行实现。
-- `utils/`：真实 CSV 校验、本地分析库、数据字典与 SQL 路由判断。
+- `utils/`：真实 CSV 校验、MySQL/SQLite 分析库、数据清洗导入、数据字典与 SQL 路由判断。
 - `sql/`：MySQL 基础表结构与 10 张预聚合表刷新 SQL。
 - `dashboard/`：原生 HTML/CSS/JS 双栏交互页面。
 - `docs/`：骨架说明、API Key 说明、运行与验收手册。
@@ -68,6 +68,41 @@ QWEN_MODEL=qwen3.6-plus
 
 默认一个 Qwen/DashScope Key 供所有 Agent 共享即可。详见 `docs/API_KEY.md`。
 
-## 数据准备
+## MySQL 数据准备
 
-真实 Olist CSV 文件应放入 `data/raw/`。原始 CSV、SQLite 本地库和生成产物已在 `.gitignore` 中排除，避免提交大文件。当前运行时暂用 SQLite，本地库由真实 CSV 重建；MySQL 建表与预聚合刷新 SQL 位于 `sql/schema.sql` 与 `sql/materialized_views.sql`，用于后续迁移。
+正式运行口径使用 MySQL。确认 `.env` 已配置 `MYSQL_HOST`、`MYSQL_PORT`、`MYSQL_USER`、`MYSQL_PASSWORD`、`MYSQL_DATABASE`，并设置：
+
+```bash
+PREFER_MYSQL=1
+```
+
+首次全量清洗导入并刷新预聚合表：
+
+```bash
+python -m utils.db_init --mysql-bootstrap --force
+```
+
+后续刷新和行数校验：
+
+```bash
+python -m utils.db_init --mysql-bootstrap
+python -m utils.db_init --counts
+```
+
+性能对比数据：
+
+```bash
+python -m utils.perf_compare
+```
+
+## SQLite 兜底数据准备
+
+真实 Olist CSV 文件应放入 `data/raw/`。原始 CSV、SQLite 本地库和生成产物已在 `.gitignore` 中排除，避免提交大文件。SQLite 本地库由真实 CSV 重建；MySQL 建表与预聚合刷新 SQL 位于 `sql/schema.sql` 与 `sql/materialized_views.sql`。
+
+如需不用 MySQL 的本地兜底演示，可设置：
+
+```bash
+PREFER_MYSQL=0
+```
+
+SQLite 本地库会由真实 CSV 重建，表结构和预聚合字段尽量与 MySQL 保持一致。

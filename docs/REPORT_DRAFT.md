@@ -15,35 +15,47 @@ flowchart LR
   Graph --> Forecast[预测 Agent]
   Graph --> Viz[可视化 Agent]
   Graph --> Decision[决策智能 Agent]
-  Analyst --> SQLite[(SQLite 当前运行库)]
+  Analyst --> MySQL[(MySQL 查询引擎)]
   Analyst --> Views[mv_* 预聚合表]
-  SQLite --> CSV[9 张真实 Olist CSV]
+  MySQL --> CSV[9 张真实 Olist CSV]
   Decision --> Qwen[Qwen API]
 ```
 
-当前因 MySQL 服务器尚未就绪，运行时暂用 SQLite；表结构、预聚合视图命名和 SQL 脚本保持 MySQL 可迁移。
+当前正式运行口径为 MySQL：9 张 Olist 原始 CSV 经过清洗导入 MySQL typed base tables，再刷新 `mv_*` 预聚合分析层。SQLite 保留为本地兜底演示引擎，表名、字段和预聚合层与 MySQL 保持一致。
 
 ## 3. 关键技术选型
 
 - LLM：Qwen/DashScope OpenAI-compatible API，负责 SQL 任务规划和业务建议生成。
 - Agent 编排：LangGraph `StateGraph`，节点包括 Orchestrator、DataAnalyst、ForecastModel、Visualizer、DecisionMaker。
-- 查询引擎：当前 SQLite，本地库由真实 CSV 构建；后续迁移 MySQL。
+- 查询引擎：MySQL 为正式查询引擎，SQLite 为本地兜底演示引擎。
 - 预测模型：基于真实 `mv_weekly_sales` 周 GMV 序列，输出未来 6 周预测值和置信区间。
 - Web：FastAPI + WebSocket 流式输出，前端双栏展示对话、SQL、图表、建议和 JSON。
 
 ## 4. 数据预处理与预聚合
 
-系统启动或刷新时核验 9 张真实 Olist CSV，缺失则尝试从公开镜像下载真实 CSV。导入后建立基础表、索引和 11 张预聚合表：
+系统启动或刷新时核验 9 张真实 Olist CSV。MySQL 导入阶段完成空值、类型和字段名清洗：空字符串转 `NULL`；时间字段导入为 `DATETIME`；金额字段导入为 `DECIMAL(12,2)`；评分、分期、重量和尺寸等字段导入为整数；Kaggle 原始产品字段 `product_name_lenght`、`product_description_lenght` 统一映射为 `product_name_length`、`product_description_length`；评论标题、评论文本与评论时间字段完整保留，用于 NLP 主题分析。导入后建立基础表、索引和 11 张预聚合表：
 
 `mv_monthly_sales`、`mv_state_sales`、`mv_category_sales`、`mv_delivery_perf`、`mv_seller_perf`、`mv_payment_dist`、`mv_weekly_sales`、`mv_state_geo`、`mv_review_category_perf`、`mv_review_topics`、`mv_weight_freight`。
 
-DataAnalyst 的提示词注入基础表和预聚合表数据字典，要求大模型优先生成命中 `mv_*` 的只读 SQL。代码层定位为大模型的"安全护栏 + 确定性证据模板"：
+核心运营指标默认以 `order_status='delivered'` 的已交付订单为统计口径，避免取消、不可用或未送达订单污染 GMV、配送时长和预测序列。DataAnalyst 的提示词注入基础表和预聚合表数据字典，要求大模型优先生成命中 `mv_*` 的只读 SQL。代码层定位为大模型的"安全护栏 + 确定性证据模板"：
 
 - 业务 SQL 规划与查询结果的自然语言直答均由大模型实时完成，代码不再用写死 if-else 拼装答案；
 - 仅保留一组确定性的 `mv_*` 证据查询模板（如地图所需的州级经纬度 JOIN、预测所需的周 GMV 序列），用于保证地图/预测这类机械取数稳定可复现——这类查询用大模型每次重写反而易引入偏差；
-- 所有 SQL 经过只读校验、危险语句拦截和 SQLite 方言规整后才执行，非法或缺数据时明确报错。
+- 所有 SQL 经过只读校验、危险语句拦截和查询引擎方言规整后才执行，非法或缺数据时明确报错。
 
-### 4.1 负面评论主题建模（加分项：NLP 情感/主题分析融入决策）
+### 4.1 MySQL 预聚合性能优化
+
+组员 A 维护 MySQL 数据初始化入口 `python -m utils.db_init --mysql-bootstrap --force`，该命令会建库建表、清洗导入 9 张 CSV、刷新 SQL 预聚合表，并生成 Python 侧 `mv_review_topics`。当前 MySQL 行数校验显示基础表与预聚合表均已成功落地：`orders=99441`、`order_items=112650`、`geolocation=1000163`、`mv_monthly_sales=23`、`mv_state_sales=556`、`mv_delivery_perf=556`、`mv_review_topics=455`。
+
+性能对比由 `python -m utils.perf_compare` 复现。一次本机运行结果如下，正式报告截图以演示当天重新运行结果为准：
+
+| 对比项 | 基础表 JOIN 耗时(ms) | 预聚合表耗时(ms) | 加速倍数 |
+| --- | ---: | ---: | ---: |
+| 月度 GMV | 284.59 | 1.34 | 212.03x |
+| 州销售排行 | 464.05 | 8.87 | 52.31x |
+| 配送延迟 | 233.41 | 1.29 | 181.11x |
+
+### 4.2 负面评论主题建模（加分项：NLP 情感/主题分析融入决策）
 
 原 `mv_review_category_perf` 用葡萄牙语关键词 LIKE 把差评粗分为物流/质量/错发/客服/其他，由于约六成评论无文本、且大量措辞不命中关键词，**超 70% 差评落入"其他"黑洞**，无法支撑经营决策。
 

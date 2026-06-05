@@ -1,11 +1,9 @@
-"""Database initialization helpers for the Olist MySQL project.
-
-This first skeleton intentionally avoids automatic downloads or destructive imports.
-Run the printed MySQL commands after placing CSV data in data/raw/ and reviewing SQL.
-"""
+"""Database initialization helpers for the Olist MySQL project."""
 
 from __future__ import annotations
 
+import argparse
+import json
 import os
 from pathlib import Path
 
@@ -25,7 +23,27 @@ def mysql_command(sql_file: Path) -> str:
 
 
 def main() -> None:
-    """Print reproducible next-step commands for database setup."""
+    """Run or print reproducible database setup commands."""
+    parser = argparse.ArgumentParser(description="Initialize the Olist Agentic BI database.")
+    parser.add_argument("--print-commands", action="store_true", help="Only print the manual mysql commands.")
+    parser.add_argument("--mysql-bootstrap", action="store_true", help="Create schema, import cleaned CSVs, and refresh mv_* in MySQL.")
+    parser.add_argument("--force", action="store_true", help="Reload base CSVs before refreshing MySQL pre-aggregations.")
+    parser.add_argument("--counts", action="store_true", help="Print MySQL base and mv_* table row counts.")
+    args = parser.parse_args()
+
+    if args.mysql_bootstrap:
+        from utils.mysql_store import bootstrap_mysql_store, table_counts_mysql
+
+        source = bootstrap_mysql_store(force=args.force)
+        print(json.dumps({"source": source, "counts": table_counts_mysql()}, ensure_ascii=False, indent=2))
+        return
+
+    if args.counts:
+        from utils.mysql_store import table_counts_mysql
+
+        print(json.dumps(table_counts_mysql(), ensure_ascii=False, indent=2))
+        return
+
     print("1. Create schema and base tables:")
     print(mysql_command(SCHEMA_SQL))
     print("2. Import Olist CSV files into the base tables.")

@@ -96,9 +96,13 @@ CREATE TABLE IF NOT EXISTS order_reviews (
   review_id VARCHAR(64),
   order_id VARCHAR(64) NOT NULL,
   review_score INT,
+  review_comment_title TEXT NULL,
   review_comment_message TEXT NULL,
+  review_creation_date DATETIME NULL,
+  review_answer_timestamp DATETIME NULL,
   PRIMARY KEY (review_id, order_id),
   INDEX idx_reviews_order (order_id),
   INDEX idx_reviews_score (review_score),
+  INDEX idx_reviews_creation_date (review_creation_date),
   CONSTRAINT fk_reviews_order FOREIGN KEY (order_id) REFERENCES orders (order_id)
 );

@@ -44,6 +44,36 @@ MATERIALIZED_VIEW_NAMES = (
     "mv_weight_freight",
 )
 
+CANONICAL_COLUMNS = {
+    "products": (
+        "product_id",
+        "product_category_name",
+        "product_name_length",
+        "product_description_length",
+        "product_photos_qty",
+        "product_weight_g",
+        "product_length_cm",
+        "product_height_cm",
+        "product_width_cm",
+    ),
+    "order_reviews": (
+        "review_id",
+        "order_id",
+        "review_score",
+        "review_comment_title",
+        "review_comment_message",
+        "review_creation_date",
+        "review_answer_timestamp",
+    ),
+}
+
+SOURCE_COLUMN_ALIASES = {
+    "products": {
+        "product_name_length": "product_name_lenght",
+        "product_description_length": "product_description_lenght",
+    }
+}
+
 
 @dataclass(frozen=True)
 class QueryResult:
@@ -78,7 +108,8 @@ def _import_csv(conn: sqlite3.Connection, csv_path: Path, table: str) -> None:
     """Import one real CSV as TEXT columns to avoid lossy type conversion."""
     with csv_path.open("r", encoding="utf-8-sig", newline="") as handle:
         reader = csv.DictReader(handle)
-        columns = reader.fieldnames or []
+        columns = list(CANONICAL_COLUMNS.get(table, tuple(reader.fieldnames or [])))
+        aliases = SOURCE_COLUMN_ALIASES.get(table, {})
         quoted_columns = ", ".join(f'"{column}" TEXT' for column in columns)
         conn.execute(f'DROP TABLE IF EXISTS "{table}"')
         conn.execute(f'CREATE TABLE "{table}" ({quoted_columns})')
@@ -87,7 +118,7 @@ def _import_csv(conn: sqlite3.Connection, csv_path: Path, table: str) -> None:
         insert_sql = f'INSERT INTO "{table}" ({quoted_names}) VALUES ({placeholders})'
         batch = []
         for row in reader:
-            batch.append([row.get(column, "") for column in columns])
+            batch.append([row.get(aliases.get(column, column), "") for column in columns])
             if len(batch) >= 5000:
                 conn.executemany(insert_sql, batch)
                 batch.clear()
@@ -132,11 +163,13 @@ def refresh_materialized_views(conn: sqlite3.Connection) -> None:
         SELECT
           substr(o.order_purchase_timestamp, 1, 7) AS year_month,
           COUNT(DISTINCT o.order_id) AS total_orders,
+          COUNT(DISTINCT c.customer_unique_id) AS unique_customers,
           ROUND(SUM(CAST(oi.price AS REAL) + CAST(oi.freight_value AS REAL)), 2) AS total_gmv,
           ROUND(SUM(CAST(oi.price AS REAL) + CAST(oi.freight_value AS REAL)) / COUNT(DISTINCT o.order_id), 2) AS avg_basket,
           ROUND(AVG(CAST(oi.price AS REAL)), 2) AS avg_price,
           ROUND(SUM(CAST(oi.freight_value AS REAL)), 2) AS total_freight
         FROM orders o
+        JOIN customers c ON o.customer_id = c.customer_id
         JOIN order_items oi ON o.order_id = oi.order_id
         WHERE o.order_status = 'delivered'
         GROUP BY year_month;
@@ -147,6 +180,7 @@ def refresh_materialized_views(conn: sqlite3.Connection) -> None:
           substr(o.order_purchase_timestamp, 1, 7) AS year_month,
           c.customer_state,
           COUNT(DISTINCT o.order_id) AS total_orders,
+          COUNT(DISTINCT c.customer_unique_id) AS unique_customers,
           ROUND(SUM(CAST(oi.price AS REAL) + CAST(oi.freight_value AS REAL)), 2) AS total_gmv,
           ROUND(SUM(CAST(oi.price AS REAL) + CAST(oi.freight_value AS REAL)) / COUNT(DISTINCT o.order_id), 2) AS avg_order_value
         FROM orders o
@@ -160,8 +194,10 @@ def refresh_materialized_views(conn: sqlite3.Connection) -> None:
         SELECT
           substr(o.order_purchase_timestamp, 1, 7) AS year_month,
           COALESCE(t.product_category_name_english, p.product_category_name, 'unknown') AS product_category_name,
+          COALESCE(t.product_category_name_english, p.product_category_name, 'unknown') AS product_category_english,
           COUNT(DISTINCT o.order_id) AS total_orders,
           COUNT(*) AS total_items,
+          ROUND(AVG(CAST(oi.price AS REAL)), 2) AS avg_price,
           ROUND(SUM(CAST(oi.price AS REAL) + CAST(oi.freight_value AS REAL)), 2) AS total_gmv
         FROM orders o
         JOIN order_items oi ON o.order_id = oi.order_id
@@ -178,7 +214,10 @@ def refresh_materialized_views(conn: sqlite3.Connection) -> None:
           COUNT(DISTINCT o.order_id) AS total_orders,
           ROUND(AVG(julianday(o.order_delivered_customer_date) - julianday(o.order_purchase_timestamp)), 2) AS avg_delivery_days,
           SUM(CASE WHEN o.order_delivered_customer_date > o.order_estimated_delivery_date THEN 1 ELSE 0 END) AS late_orders,
-          ROUND(1.0 * SUM(CASE WHEN o.order_delivered_customer_date > o.order_estimated_delivery_date THEN 1 ELSE 0 END) / COUNT(DISTINCT o.order_id), 4) AS late_rate
+          SUM(CASE WHEN o.order_delivered_customer_date > o.order_estimated_delivery_date THEN 1 ELSE 0 END) AS delayed_orders,
+          SUM(CASE WHEN o.order_delivered_customer_date <= o.order_estimated_delivery_date THEN 1 ELSE 0 END) AS on_time_orders,
+          ROUND(1.0 * SUM(CASE WHEN o.order_delivered_customer_date > o.order_estimated_delivery_date THEN 1 ELSE 0 END) / COUNT(DISTINCT o.order_id), 4) AS late_rate,
+          ROUND(1.0 * SUM(CASE WHEN o.order_delivered_customer_date <= o.order_estimated_delivery_date THEN 1 ELSE 0 END) / COUNT(DISTINCT o.order_id), 4) AS on_time_rate
         FROM orders o
         JOIN customers c ON o.customer_id = c.customer_id
         WHERE o.order_status = 'delivered'
@@ -193,6 +232,9 @@ def refresh_materialized_views(conn: sqlite3.Connection) -> None:
           s.seller_state,
           COUNT(DISTINCT o.order_id) AS total_orders,
           ROUND(SUM(CAST(oi.price AS REAL) + CAST(oi.freight_value AS REAL)), 2) AS total_gmv,
+          COUNT(DISTINCT r.review_id) AS total_reviews,
+          COUNT(DISTINCT CASE WHEN CAST(r.review_score AS INTEGER) <= 2 THEN r.review_id END) AS negative_reviews,
+          ROUND(1.0 * COUNT(DISTINCT CASE WHEN CAST(r.review_score AS INTEGER) <= 2 THEN r.review_id END) / NULLIF(COUNT(DISTINCT r.review_id), 0), 4) AS negative_rate,
           ROUND(AVG(CAST(r.review_score AS REAL)), 2) AS avg_review_score
         FROM orders o
         JOIN order_items oi ON o.order_id = oi.order_id
@@ -208,6 +250,8 @@ def refresh_materialized_views(conn: sqlite3.Connection) -> None:
           op.payment_type,
           CAST(op.payment_installments AS INTEGER) AS payment_installments,
           COUNT(*) AS payment_count,
+          COUNT(*) AS total_transactions,
+          ROUND(AVG(CAST(op.payment_installments AS REAL)), 2) AS avg_installments,
           ROUND(SUM(CAST(op.payment_value AS REAL)), 2) AS payment_value
         FROM orders o
         JOIN order_payments op ON o.order_id = op.order_id
@@ -336,6 +380,10 @@ def refresh_materialized_views(conn: sqlite3.Connection) -> None:
 
 def bootstrap_local_store(force: bool = False, data_dir: Path | None = None, db_path: Path | None = None) -> str:
     """Create a local SQLite store from real CSVs and refresh materialized tables."""
+    if settings.prefer_mysql and data_dir is None and db_path is None:
+        from utils.mysql_store import bootstrap_mysql_store
+
+        return bootstrap_mysql_store(force=force)
     source = ensure_dataset(data_dir or settings.data_dir)
     conn = _connect(db_path)
     try:
@@ -360,6 +408,11 @@ def ensure_local_store() -> str:
 
 def run_query(sql: str, limit: int = 200) -> QueryResult:
     """Execute a read-only SQL query against the local analytics store."""
+    if settings.prefer_mysql:
+        from utils.mysql_store import run_query_mysql
+
+        columns, rows, elapsed_ms, source = run_query_mysql(sql, limit=limit)
+        return QueryResult(columns=columns, rows=rows, elapsed_ms=elapsed_ms, row_count=len(rows), source=source)
     ensure_local_store()
     stripped = sql.strip().rstrip(";")
     lowered = stripped.lower()
@@ -381,6 +434,10 @@ def run_query(sql: str, limit: int = 200) -> QueryResult:
 
 def table_counts() -> dict[str, int]:
     """Return row counts for base and aggregate tables."""
+    if settings.prefer_mysql:
+        from utils.mysql_store import table_counts_mysql
+
+        return table_counts_mysql()
     ensure_local_store()
     conn = _connect()
     try:
