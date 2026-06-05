@@ -333,6 +333,9 @@ def refresh_materialized_views(conn: sqlite3.Connection) -> None:
     # 负面评论主题建模（TF-IDF + NMF）：用 Python 在基础表上训练，产出 mv_review_topics。
     build_review_topic_table(conn)
 
+    # 收集统计信息，避免 SQLite 在缺少统计时为多表 JOIN 临时自建索引（会让查询慢几个数量级）。
+    conn.execute("ANALYZE")
+
 
 def bootstrap_local_store(force: bool = False, data_dir: Path | None = None, db_path: Path | None = None) -> str:
     """Create a local SQLite store from real CSVs and refresh materialized tables."""

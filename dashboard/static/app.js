@@ -20,8 +20,19 @@ const panels = {
   sql: document.querySelector("#sql-output"),
   agent: document.querySelector("#agent-events"),
   advice: document.querySelector("#advice-stream"),
+  whatif: document.querySelector("#whatif-block"),
   forecast: document.querySelector("#forecast-json"),
   raw: document.querySelector("#raw-output"),
+};
+
+// 各 Agent 启动时的进度文案：让"等待大模型"阶段显式"在动"，而不是停在静态提示上像卡死。
+const AGENT_PROGRESS = {
+  orchestrator: "协调器规划中…",
+  data_analyst: "数据分析 Agent 查询中…",
+  forecast_model: "预测 Agent 计算中…",
+  whatif_model: "What-if 反事实模拟中…",
+  visualizer: "可视化 Agent 生成图表中…",
+  decision_maker: "决策 Agent 生成建议中…",
 };
 
 let activeSocket = null;
@@ -88,6 +99,7 @@ function resetResult(text = "正在建立 WebSocket 流式分析，请稍候..."
   panels.sql.textContent = "等待 SQL 规划...";
   panels.agent.innerHTML = "";
   panels.advice.textContent = "等待真实大模型流式输出...";
+  panels.whatif.innerHTML = "";
   panels.forecast.innerHTML = "";
   panels.raw.textContent = "[]";
   activeChart = null;
@@ -229,6 +241,7 @@ function renderAgentEvent(event) {
     summary: `完成真实数据查询 ${event.elapsed_ms ?? ""}ms`,
     chart_done: "生成可视化图表",
     chart: "生成可视化图表",
+    whatif: "完成 What-if 反事实模拟",
     memory: `载入会话记忆 ${event.turn_count || 0} 轮`,
     memory_updated: `写入会话记忆 ${event.turn_count || 0} 轮`,
     llm_usage: `大模型 token: ${event.total_tokens}`,
@@ -332,6 +345,29 @@ function appendAdviceDelta(state, content) {
   panels.advice.textContent += content;
 }
 
+function renderWhatif(whatif) {
+  if (!whatif) {
+    panels.whatif.innerHTML = "";
+    return;
+  }
+  if (whatif.error) {
+    panels.whatif.innerHTML = `<h3>What-if 反事实模拟</h3><p class="muted">模拟未生成：${escapeHtml(whatif.error)}</p>`;
+    return;
+  }
+  const unit = whatif.unit || "";
+  const share = Number.isFinite(whatif.affected_share) ? `${(whatif.affected_share * 100).toFixed(1)}%` : "-";
+  const rows = [
+    ["场景", whatif.scenario_label],
+    ["指标", whatif.metric_label],
+    ["干预前", `${whatif.baseline} ${unit}`],
+    ["干预后", `${whatif.scenario} ${unit}`],
+    ["变化", `${whatif.delta > 0 ? "+" : ""}${whatif.delta} ${unit}（${whatif.direction}）`],
+    ["影响范围", `${whatif.affected_count} 条 / ${share}`],
+  ];
+  const table = rows.map(([key, value]) => `<tr><th>${escapeHtml(key)}</th><td>${escapeHtml(value)}</td></tr>`).join("");
+  panels.whatif.innerHTML = `<h3>What-if 反事实模拟</h3><p>${escapeHtml(whatif.narrative)}</p><table class="data-table"><tbody>${table}</tbody></table>`;
+}
+
 function renderForecast(forecast, diagnostics = {}) {
   if (!forecast?.length && !Object.keys(diagnostics || {}).length) {
     panels.forecast.innerHTML = "";
@@ -374,6 +410,52 @@ function startStreamingAnalysis(question, options = {}) {
     failed: false,
   };
   let rawRenderTimer = null;
+  let watchdogTimer = null;
+  let slowTicks = 0;
+  const WATCHDOG_MS = 45000;
+
+  function clearWatchdog() {
+    if (watchdogTimer) {
+      window.clearTimeout(watchdogTimer);
+      watchdogTimer = null;
+    }
+  }
+
+  function slowResendControls(currentQuestion) {
+    const wrapper = document.createElement("div");
+    wrapper.className = "retry-actions";
+    const resend = document.createElement("button");
+    resend.type = "button";
+    resend.className = "secondary compact";
+    resend.textContent = "重发当前问题";
+    resend.addEventListener("click", () => {
+      appendMessage(`重发：${currentQuestion}`, "user");
+      resetResult("正在重新发起分析…");
+      startStreamingAnalysis(currentQuestion);
+    });
+    wrapper.appendChild(resend);
+    return wrapper;
+  }
+
+  // 看门狗：距上一条事件超过 WATCHDOG_MS 仍无新进展时给出非致命提示，避免"静默假死"。
+  function armWatchdog() {
+    clearWatchdog();
+    if (state.finished || state.failed) return;
+    watchdogTimer = window.setTimeout(() => {
+      if (socket !== activeSocket || state.finished || state.failed) return;
+      slowTicks += 1;
+      const waited = Math.round((WATCHDOG_MS / 1000) * slowTicks);
+      const stronger = slowTicks >= 2;
+      setPill(connectionState, "响应较慢", "running");
+      const hint = stronger
+        ? `大模型已等待约 ${waited} 秒仍无响应，通常是网络/接口延迟而非系统故障。可点击下方重发当前问题，或改用命令行 python cli.py 兜底演示。`
+        : `大模型响应较慢（已等待约 ${waited} 秒），通常是网络/接口延迟，可再稍候。`;
+      panels.summary.innerHTML = "";
+      panels.summary.append(document.createTextNode(hint), slowResendControls(question));
+      armWatchdog();
+    }, WATCHDOG_MS);
+  }
+
   const socket = new WebSocket(wsUrl("/ws/analyze"));
   activeSocket = socket;
 
@@ -397,6 +479,7 @@ function startStreamingAnalysis(question, options = {}) {
       retry_of: options.retryOf || "",
       error_context: options.errorContext || "",
     }));
+    armWatchdog();
   });
 
   socket.addEventListener("message", (message) => {
@@ -404,6 +487,7 @@ function startStreamingAnalysis(question, options = {}) {
     state.events.push(event);
     scheduleRawRender(event.event !== "llm_delta");
     renderAgentEvent(event);
+    armWatchdog();
 
     if (event.event === "session") {
       sessionId = event.session_id;
@@ -417,6 +501,14 @@ function startStreamingAnalysis(question, options = {}) {
       memoryCount.textContent = `记忆 ${state.memoryTurns} 轮`;
       panels.kpis.innerHTML = renderKpis(state);
       if (event.last_question) panels.summary.textContent = `已载入上一轮上下文：${event.last_question}`;
+      return;
+    }
+
+    if (event.event === "agent_start") {
+      const label = AGENT_PROGRESS[event.agent] || `${event.agent} 处理中…`;
+      setStage(label, "running");
+      // 仅在还没有真实直答时用进度文案占位，避免覆盖后续生成的结论。
+      if (!state.directAnswer) panels.directAnswer.textContent = label;
       return;
     }
 
@@ -452,6 +544,12 @@ function startStreamingAnalysis(question, options = {}) {
       return;
     }
 
+    if (event.event === "whatif") {
+      state.whatif = event.whatif;
+      renderWhatif(event.whatif);
+      return;
+    }
+
     if (event.event === "llm_delta") {
       appendAdviceDelta(state, event.content);
       return;
@@ -459,6 +557,7 @@ function startStreamingAnalysis(question, options = {}) {
 
     if (event.event === "data_error" || event.event === "llm_error" || event.event === "sql_error") {
       state.failed = true;
+      clearWatchdog();
       rememberFailure(event, question);
       const label = event.event === "data_error" ? "数据错误" : event.event === "llm_error" ? "大模型错误" : "SQL规划/执行错误";
       setError(`${label}：${event.error}`);
@@ -468,8 +567,13 @@ function startStreamingAnalysis(question, options = {}) {
 
     if (event.event === "final" || event.event === "done") {
       state.finished = true;
+      clearWatchdog();
       state.forecast = event.forecast || [];
       state.forecastDiagnostics = event.forecast_diagnostics || {};
+      if (event.whatif) {
+        state.whatif = event.whatif;
+        renderWhatif(event.whatif);
+      }
       renderForecast(state.forecast, state.forecastDiagnostics);
       scheduleRawRender(true);
       setStage("完成", "done");
@@ -483,12 +587,14 @@ function startStreamingAnalysis(question, options = {}) {
 
   socket.addEventListener("error", () => {
     state.failed = true;
+    clearWatchdog();
     rememberFailure({ event: "socket_error", error: "WebSocket 连接失败" }, question);
     setError("WebSocket 连接失败，请检查后端是否启动。");
     appendMessage("WebSocket 连接失败，请检查后端是否启动。", "assistant", retryControls());
   });
 
   socket.addEventListener("close", () => {
+    clearWatchdog();
     if (!state.finished && !state.failed) {
       rememberFailure({ event: "socket_closed", error: "流式连接提前关闭" }, question);
       setError("流式连接提前关闭，请检查后端日志。");

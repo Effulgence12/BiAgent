@@ -15,10 +15,11 @@ from langgraph.graph import END, StateGraph
 from models.forecast import forecast_sales_6_weeks_with_diagnostics
 from utils.llm_client import chat_completion
 from utils.schema import render_schema_context
+from utils.whatif import SCENARIOS, default_scenario, detect_whatif, run_whatif
 
 
 ANALYSIS_TYPES = {"descriptive", "diagnostic", "predictive", "prescriptive"}
-KNOWN_AGENTS = {"orchestrator", "data_analyst", "forecast_model", "visualizer", "decision_maker"}
+KNOWN_AGENTS = {"orchestrator", "data_analyst", "forecast_model", "whatif_model", "visualizer", "decision_maker"}
 KNOWN_VIEWS = {
     "mv_monthly_sales",
     "mv_state_sales",
@@ -68,6 +69,7 @@ class WorkflowResult:
     recommendations: list[str]
     forecast: list[dict[str, float | str]]
     forecast_diagnostics: dict[str, object]
+    whatif: dict[str, Any] | None = None
 
 
 class WorkflowState(TypedDict, total=False):
@@ -83,6 +85,7 @@ class WorkflowState(TypedDict, total=False):
     recommendations: list[str]
     forecast: list[dict[str, float | str]]
     forecast_diagnostics: dict[str, object]
+    whatif: dict[str, Any] | None
 
 
 def classify_question(question: str) -> str:
@@ -187,10 +190,11 @@ def _steps_for_agents(required_agents: tuple[str, ...], analysis_type: str) -> t
         "orchestrator": "Orchestrator: use LLM structured planning to parse intent and choose agent path",
         "data_analyst": "DataAnalyst: generate view-first SQL from the planner output and summarize evidence",
         "forecast_model": "ForecastModel: build ETS forecast and expose diagnostics when a future series is required",
+        "whatif_model": "WhatIf: 反事实模拟，排除指定群体后在真实数据上重算平台指标并对比干预前后",
         "visualizer": "Visualizer: render charts from planner chart requirements and query result shape",
         "decision_maker": "DecisionMaker: generate data-grounded recommendations with the real LLM",
     }
-    ordered = [agent for agent in ("orchestrator", "data_analyst", "forecast_model", "visualizer", "decision_maker") if agent in required_agents]
+    ordered = [agent for agent in ("orchestrator", "data_analyst", "forecast_model", "visualizer", "whatif_model", "decision_maker") if agent in required_agents]
     if analysis_type != "predictive":
         ordered = [agent for agent in ordered if agent != "forecast_model"]
     return tuple(labels[agent] for agent in ordered)
@@ -299,11 +303,17 @@ def _refine_plan_node(state: WorkflowState) -> WorkflowState:
     """Validate the LLM plan against executed data without replacing it by keyword routing."""
     data_analysis = state["data_analysis"]
     original = state["plan"]
+    analysis_type = original.analysis_type
+    required_agents = original.required_agents
     columns = {column for result in data_analysis.results.values() for column in result.columns}
-    if {"week_start", "total_gmv"}.issubset(columns) and original.analysis_type != "predictive":
-        required_agents = tuple(dict.fromkeys((*original.required_agents, "forecast_model")))
-        return {"plan": replace(original, analysis_type="predictive", required_agents=required_agents, steps=_steps_for_agents(required_agents, "predictive"))}
-    return {"plan": original}
+    if {"week_start", "total_gmv"}.issubset(columns) and analysis_type != "predictive":
+        analysis_type = "predictive"
+        required_agents = tuple(dict.fromkeys((*required_agents, "forecast_model")))
+    if detect_whatif(state["question"]) and "whatif_model" not in required_agents:
+        required_agents = tuple(dict.fromkeys((*required_agents, "whatif_model")))
+    if analysis_type == original.analysis_type and required_agents == original.required_agents:
+        return {"plan": original}
+    return {"plan": replace(original, analysis_type=analysis_type, required_agents=required_agents, steps=_steps_for_agents(required_agents, analysis_type))}
 
 
 def _forecast_node(state: WorkflowState) -> WorkflowState:
@@ -342,6 +352,50 @@ def _visualizer_node(state: WorkflowState) -> WorkflowState:
     }
 
 
+WHATIF_SELECT_SYSTEM_PROMPT = (
+    "你是 What-if 反事实分析 Agent，需要把用户的假设性问题映射到一个预置反事实场景。"
+    "只能从给定场景里选择，不要编造场景。"
+)
+
+
+def _select_whatif(question: str) -> tuple[str, dict[str, Any]]:
+    """让大模型把自然语言假设映射到注册场景；失败时退回确定性关键词兜底。"""
+    options = "\n".join(f"- {scenario_id}: {spec['hint']}" for scenario_id, spec in SCENARIOS.items())
+    prompt = (
+        f"用户问题：{question}\n\n"
+        f"可选反事实场景：\n{options}\n\n"
+        '只返回 JSON：{"scenario_id": "<上面之一或空字符串>", "params": {"top_n": 20}}\n'
+        "若问题与所有场景都不匹配，scenario_id 返回空字符串。"
+    )
+    try:
+        response = chat_completion(WHATIF_SELECT_SYSTEM_PROMPT, prompt, max_tokens=200)
+        payload = _extract_json_object(response.content)
+        scenario_id = str(payload.get("scenario_id") or "").strip()
+        params = payload.get("params") if isinstance(payload.get("params"), dict) else {}
+        if scenario_id in SCENARIOS:
+            return scenario_id, params
+    except Exception:
+        pass
+    return default_scenario(question)
+
+
+def _whatif_node(state: WorkflowState) -> WorkflowState:
+    """反事实模拟 Agent：选场景 → 在真实数据上确定性重算 → 输出干预前后对比。"""
+    scenario_id, params = _select_whatif(state["question"])
+    if not scenario_id:
+        return {"whatif": None}
+    try:
+        return {"whatif": run_whatif(scenario_id, params).to_dict()}
+    except Exception as exc:  # 加分项失败不应阻断主流程，但要如实暴露错误
+        return {"whatif": {"scenario_id": scenario_id, "error": str(exc)}}
+
+
+def _whatif_narrative(whatif: dict[str, Any] | None) -> str:
+    if not whatif or whatif.get("error"):
+        return ""
+    return str(whatif.get("narrative") or "")
+
+
 def _decision_node(state: WorkflowState) -> WorkflowState:
     if not state.get("generate_recommendations", True):
         return {"recommendations": []}
@@ -354,6 +408,7 @@ def _decision_node(state: WorkflowState) -> WorkflowState:
             data_analysis.summary,
             question=state["question"],
             direct_answer=data_analysis.direct_answer,
+            whatif_summary=_whatif_narrative(state.get("whatif")),
         )
     }
 
@@ -365,6 +420,7 @@ def _build_workflow_graph():
     graph.add_node("data_analyst", _data_node)
     graph.add_node("orchestrator_refine", _refine_plan_node)
     graph.add_node("forecast_model", _forecast_node)
+    graph.add_node("whatif_model", _whatif_node)
     graph.add_node("visualizer", _visualizer_node)
     graph.add_node("decision_maker", _decision_node)
     graph.set_entry_point("orchestrator")
@@ -376,7 +432,12 @@ def _build_workflow_graph():
         {"forecast_model": "forecast_model", "visualizer": "visualizer"},
     )
     graph.add_edge("forecast_model", "visualizer")
-    graph.add_edge("visualizer", "decision_maker")
+    graph.add_conditional_edges(
+        "visualizer",
+        lambda state: "whatif_model" if detect_whatif(state["question"]) else "decision_maker",
+        {"whatif_model": "whatif_model", "decision_maker": "decision_maker"},
+    )
+    graph.add_edge("whatif_model", "decision_maker")
     graph.add_edge("decision_maker", END)
     return graph.compile()
 
@@ -401,4 +462,5 @@ def run_workflow(question: str, generate_recommendations: bool = True, initial_p
         recommendations=state["recommendations"],
         forecast=state.get("forecast", []),
         forecast_diagnostics=state.get("forecast_diagnostics", {}),
+        whatif=state.get("whatif"),
     )

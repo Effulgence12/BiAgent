@@ -13,6 +13,7 @@ flowchart LR
   Graph --> Orchestrator[协调器 Agent]
   Graph --> Analyst[数据分析 Agent]
   Graph --> Forecast[预测 Agent]
+  Graph --> WhatIf[What-if 反事实 Agent]
   Graph --> Viz[可视化 Agent]
   Graph --> Decision[决策智能 Agent]
   Analyst --> SQLite[(SQLite 当前运行库)]
@@ -26,7 +27,7 @@ flowchart LR
 ## 3. 关键技术选型
 
 - LLM：Qwen/DashScope OpenAI-compatible API，负责 SQL 任务规划和业务建议生成。
-- Agent 编排：LangGraph `StateGraph`，节点包括 Orchestrator、DataAnalyst、ForecastModel、Visualizer、DecisionMaker。
+- Agent 编排：LangGraph `StateGraph`，节点包括 Orchestrator、DataAnalyst、ForecastModel、WhatIf（反事实模拟，按问题意图条件触发）、Visualizer、DecisionMaker。
 - 查询引擎：当前 SQLite，本地库由真实 CSV 构建；后续迁移 MySQL。
 - 预测模型：基于真实 `mv_weekly_sales` 周 GMV 序列，输出未来 6 周预测值和置信区间。
 - Web：FastAPI + WebSocket 流式输出，前端双栏展示对话、SQL、图表、建议和 JSON。
@@ -50,6 +51,19 @@ DataAnalyst 的提示词注入基础表和预聚合表数据字典，要求大�
 为此引入 `utils/review_topics.py`：在 ETL 阶段对 `review_score<=2` 的葡语评论文本做 **TF-IDF + NMF 无监督主题建模**（scikit-learn），自动学习数据驱动的差评主题，按品类聚合落地为 `mv_review_topics`（含 `topic_label`、`topic_keywords`、`complaint_count`、`topic_share`，并含 `ALL` 平台级行）。模型本地训练秒级、无需下载预训练模型，运行时只查预聚合结果、零额外负担。
 
 实测主题揭示了关键词分类完全遗漏的真实根因——如"付款后未收到货 / 漏发缺件"（`comprei dois · recebi apenas`）与"下单后物流拖延"（`compra · pedido · dia`）。DataAnalyst 将该结果作为证据，DecisionMaker 据此输出针对履约漏发、物流提速的具体改进建议，完成"NLP 分析→决策建议"的闭环。
+
+### 4.2 What-if 反事实模拟（加分项：What-if 模拟分析）
+
+任务书要求决策智能体支持"反事实推演"——给定一个假设干预，重算某个聚合指标并对比干预前后。系统新增独立的 **WhatIf Agent 节点**（`agents/orchestrator.py` 的 `whatif_model`）：当协调器在问题中识别到"如果/假设/下架/移除"等反事实意图时，条件边把流程导向该节点；节点由大模型把自然语言假设映射到预置场景（失败时退回关键词兜底），再调用 `utils/whatif.py` 在真实订单数据上做确定性重算。
+
+计算本身保持确定性、可复现：基线与反事实来自同一批真实评价，差异只来自"排除哪一批数据"，绝不模拟编造。已落地两个场景：
+
+- **下架评分最低的 Top-N 卖家 → 平台平均评分变化**：最差卖家直接取自预聚合视图 `mv_seller_perf`（毫秒级，符合视图优先理念），仅反事实重算才下钻基础表，用一趟扫描（`CASE WHEN NOT EXISTS ...`）同时算出干预前后均分。
+- **消除所有延迟订单 → 平台平均评分变化**。
+
+实测两场景形成了有价值的数据对比：**下架最差 20 个卖家，平台均分仅从 4.142 升到 4.145（+0.003，仅影响 181 条评价）；而消除配送延迟，均分从 4.142 升到 4.283（+0.141，影响 8.1% 的评价）**。据此 DecisionMaker 给出"问题不在个别长尾卖家、而在系统性物流与履约"的数据驱动优先级建议——这正是 Agentic BI 从"看数"走向"决策"的体现。
+
+> 性能保障：建库末尾执行 `ANALYZE` 收集统计信息，避免 SQLite 在缺统计时为多表 JOIN 临时自建索引（曾导致反事实查询退化到分钟级）；反事实场景仅在用户显式提出假设性问题时触发，不增加常规问答负担。
 
 ## 5. 可视化覆盖
 
