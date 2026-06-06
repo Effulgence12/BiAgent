@@ -4,11 +4,10 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from datetime import date, timedelta
-from math import sqrt
+from statistics import median
 import warnings
 
-from statsmodels.tsa.holtwinters import ExponentialSmoothing
-from statsmodels.tools.sm_exceptions import ConvergenceWarning
+from statsmodels.tsa.arima.model import ARIMA
 
 
 def naive_forecast(values: Sequence[float], periods: int = 6) -> list[float]:
@@ -48,17 +47,19 @@ def linear_forecast(points: Sequence[dict[str, object]], value_key: str = "total
 
 
 def forecast_sales_6_weeks(points: Sequence[dict[str, object]]) -> list[dict[str, float | str]]:
-    """Forecast the next six weekly GMV points with ETS confidence intervals."""
+    """Forecast the next six weekly GMV points with ARIMA confidence intervals."""
     forecast, _diagnostics = forecast_sales_6_weeks_with_diagnostics(points)
     return forecast
 
 
 def forecast_sales_6_weeks_with_diagnostics(points: Sequence[dict[str, object]]) -> tuple[list[dict[str, float | str]], dict[str, object]]:
-    """Forecast weekly GMV with ETS and expose model diagnostics.
+    """Forecast weekly GMV with ARIMA and expose model diagnostics.
 
-    使用任务书认可的时间序列方法 ETS/指数平滑。所有输入来自真实
+    使用任务书认可的时间序列方法 ARIMA。所有输入来自真实
     `mv_weekly_sales`，模型失败时抛出真实错误，不生成模拟序列。
     """
+    horizon = 6
+    order = (1, 1, 1)
     values: list[float] = []
     dates: list[date] = []
     for point in points:
@@ -68,43 +69,73 @@ def forecast_sales_6_weeks_with_diagnostics(points: Sequence[dict[str, object]])
         except (KeyError, TypeError, ValueError):
             continue
     if not values:
-        return [], {"model": "ETS", "point_count": 0, "warnings": ["没有可用周GMV序列"]}
+        return [], {"model": "ARIMA", "point_count": 0, "warnings": ["没有可用周GMV序列"]}
     if len(values) < 8:
-        raise ValueError("真实周GMV序列不足8周，无法训练稳定的ETS预测模型")
-    model = ExponentialSmoothing(values, trend="add", seasonal=None, initialization_method="estimated")
+        raise ValueError("真实周GMV序列不足8周，无法训练稳定的ARIMA预测模型")
+
+    model_values = list(values)
+    dropped_tail_points = 0
+    if len(values) >= 12:
+        recent_complete = values[-5:-1]
+        recent_baseline = median(recent_complete)
+        if recent_baseline > 0 and values[-1] < recent_baseline * 0.25 and len(values) - 1 >= 8:
+            model_values = values[:-1]
+            dropped_tail_points = 1
+
     captured_warnings: list[str] = []
+    mae: float | None = None
+    mape: float | None = None
+    backtest_window = 0
+
+    def relevant_warning_messages(caught: list[warnings.WarningMessage]) -> list[str]:
+        messages = [str(item.message) for item in caught]
+        return [message for message in messages if "deprecated" not in message.lower()]
+
+    if len(model_values) > horizon + 8:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            backtest_model = ARIMA(model_values[:-horizon], order=order).fit()
+            backtest_predictions = [float(value) for value in backtest_model.forecast(horizon)]
+            captured_warnings.extend(relevant_warning_messages(caught))
+        actual_values = model_values[-horizon:]
+        abs_errors = [abs(actual - predicted) for actual, predicted in zip(actual_values, backtest_predictions)]
+        pct_errors = [abs(actual - predicted) / actual for actual, predicted in zip(actual_values, backtest_predictions) if actual > 0]
+        mae = sum(abs_errors) / len(abs_errors) if abs_errors else None
+        mape = sum(pct_errors) / len(pct_errors) if pct_errors else None
+        backtest_window = horizon
+
     with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always", ConvergenceWarning)
-        fitted = model.fit(optimized=True)
-        captured_warnings = [str(item.message) for item in caught if issubclass(item.category, ConvergenceWarning)]
-    fitted_values = list(fitted.fittedvalues)
-    residuals = [actual - fitted_value for actual, fitted_value in zip(values, fitted_values)]
-    residual_std = sqrt(sum(residual * residual for residual in residuals) / max(len(residuals) - 1, 1))
-    recent = list(zip(values[-12:], fitted_values[-12:]))
-    abs_errors = [abs(actual - fitted_value) for actual, fitted_value in recent]
-    pct_errors = [abs(actual - fitted_value) / actual for actual, fitted_value in recent if actual > 0]
-    mae = sum(abs_errors) / len(abs_errors) if abs_errors else 0.0
-    mape = sum(pct_errors) / len(pct_errors) if pct_errors else 0.0
-    predictions = [max(0.0, float(value)) for value in fitted.forecast(6)]
+        warnings.simplefilter("always")
+        fitted = ARIMA(model_values, order=order).fit()
+        forecast_result = fitted.get_forecast(steps=horizon)
+        captured_warnings.extend(relevant_warning_messages(caught))
+
+    predictions = [float(value) for value in forecast_result.predicted_mean]
+    confidence_intervals = forecast_result.conf_int(alpha=0.05)
     last_week = dates[-1]
     forecast = []
-    for step, yhat in enumerate(predictions, start=1):
-        band = max(residual_std * 1.96, yhat * 0.05)
+    for step in range(1, horizon + 1):
+        yhat = max(0.0, predictions[step - 1])
+        lower = max(0.0, float(confidence_intervals[step - 1][0]))
+        upper = max(lower, float(confidence_intervals[step - 1][1]))
         forecast.append(
             {
                 "week_start": (last_week + timedelta(days=7 * step)).isoformat(),
-                "model": "ETS",
+                "model": "ARIMA",
                 "yhat": round(yhat, 2),
-                "yhat_lower": round(max(0.0, yhat - band), 2),
-                "yhat_upper": round(yhat + band, 2),
+                "yhat_lower": round(lower, 2),
+                "yhat_upper": round(upper, 2),
             }
         )
     diagnostics = {
-        "model": "ETS",
+        "model": "ARIMA",
+        "order": list(order),
         "point_count": len(values),
-        "backtest_window": len(abs_errors),
-        "mae": round(mae, 2),
-        "mape": round(mape, 4),
+        "training_point_count": len(model_values),
+        "dropped_tail_points": dropped_tail_points,
+        "backtest_window": backtest_window,
+        "mae": round(mae, 2) if mae is not None else None,
+        "mape": round(mape, 4) if mape is not None else None,
         "warnings": captured_warnings,
     }
     return forecast, diagnostics

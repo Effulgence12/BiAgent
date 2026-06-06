@@ -20,7 +20,7 @@
 1. 预聚合**性能对比截图**（任务书硬性要求，报告里需要有一个章节用普通查询对比 agent，这个应该是要手动查然后截图？）。
 2. **MySQL 接入**与运行口径说明。
 3. **数据精细 ETL**（清洗 / 类型 / 空值）。
-4. **预测模型优化** —— 见第 3 节组员 B 任务 B5。
+4. **预测模型优化** —— 见第 3 节组员 B 任务 B3。
 5. **正式报告 + 演示截图** —— 三人共同（见第 3 节说明）。
 
 ## 3. 分工
@@ -38,7 +38,7 @@
 
 ### 组员 B — 演示与可视化
 
-以及 B5 预测模型涉及的 `models/forecast.py`（并按 B5 同步 `agents/orchestrator.py`、`tests/test_skeleton.py` 中的 `"ETS"` 字样）。**建议勿改 `sql/` 与 `utils/local_store.py`**（避免与 A 冲突）。
+以及 B5 预测模型涉及的 `models/forecast.py`（并按 B5 同步 `agents/orchestrator.py`、`tests/test_skeleton.py` 中的 `"ETS"` 字样）。**建议勿改** **`sql/`** **与** **`utils/local_store.py`**（避免与 A 冲突）。
 
 - **B1**：跑 Web，确认问答 / SQL / 图表 / 建议 / 错误提示。
 - **B2 撰写报告相关章节**：把直答 + 建议截图等整理进报告相关章节。
@@ -53,8 +53,8 @@
 - 更关键：**任务书要求预测模型从 Prophet / ARIMA / LSTM / XGBoost 中选用**，ETS 不在其列。所以这一步首先是**合规问题**，其次才是精度。
 
 1. 怎么实现的 / 在哪
-   位置：models/forecast.py 的 forecast_sales_6_weeks_with_diagnostics(points)（第 56–110 行）。真正生效的就是这一个函数；同文件的 naive_forecast、linear_forecast 是给旧测试留的死代码，不参与主链路。
-   调用点：agents/orchestrator.py:329 的 forecast_node——当 Planner 判定为 predictive 时，条件边路由到 forecast_model 节点，把 mv_weekly_sales 的 week_start/total_gmv 行喂进去。
+   位置：models/forecast.py 的 forecast\_sales\_6\_weeks\_with\_diagnostics(points)（第 56–110 行）。真正生效的就是这一个函数；同文件的 naive\_forecast、linear\_forecast 是给旧测试留的死代码，不参与主链路。
+   调用点：agents/orchestrator.py:329 的 forecast\_node——当 Planner 判定为 predictive 时，条件边路由到 forecast\_model 节点，把 mv\_weekly\_sales 的 week\_start/total\_gmv 行喂进去。
    算法（第 74 行）：statsmodels 的 ExponentialSmoothing（ETS / Holt 线性趋势指数平滑），trend="add"、seasonal=None。
 
 - 取真实周 GMV 序列，不足 8 周直接报错（第 72–73 行）；
@@ -63,19 +63,19 @@
 - 诊断里的 MAE/MAPE 用最近 12 个点的样本内拟合值算（第 83–87 行）。
 
 1. 能勉强提交吗？
-   能跑、能演示，但不建议直接当最终版交。它端到端是通的（附录验收 10/10、每条预测都带 yhat/yhat_lower/yhat_upper、有趋势解读），作为"保底"能撑住答辩流程。但在评分表上它踩了一个硬合规线（见缺陷 ①），一旦被严格对照任务书就会在预测这一块失分。所以定位是"勉强保底，风险明确"。 3.主要缺陷（按严重度排）
+   能跑、能演示，但不建议直接当最终版交。它端到端是通的（附录验收 10/10、每条预测都带 yhat/yhat\_lower/yhat\_upper、有趋势解读），作为"保底"能撑住答辩流程。但在评分表上它踩了一个硬合规线（见缺陷 ①），一旦被严格对照任务书就会在预测这一块失分。所以定位是"勉强保底，风险明确"。 3.主要缺陷（按严重度排）
 
-| #   | 缺陷                                                                                                                                                                 | 严重度 |
-| --- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------ |
-| ①   | 选型不合规：任务书要求 Prophet/ARIMA/LSTM/XGBoost，ETS 不在其列。这是最大风险，不是精度问题而是"用错了模型族"                                                        | 🔴 高  |
-| ②   | 精度差：留出验收 MAPE≈74.86%，被追问准确率会很被动                                                                                                                   | 🔴 高  |
-| ③   | 收敛告警：Optimization failed to converge，optimizer 没收敛，演示日志里会暴露                                                                                        | 🟠 中  |
-| ④   | 置信区间是"伪区间"：用残差 std×1.96 的对称经验带 + max(yhat0.05)兜底，不是模型自身的预测区间；而且区间宽度不随预测步长变宽（多步预测不确定性本应递增），答辩易被问破 | 🟠 中  |
-| ⑤   | 回测是样本内：MAE/MAPE 用 fittedvalues 自比，不是样本外留出法，高估了真实泛化（即便如此数值仍差）                                                                    | 🟠 中  |
-| ⑥   | 无季节性建模（seasonal=None），周度波动未捕捉（不过 91 周难做 52 周季节性，这条可接受）                                                                              | 🟡 低  |
-| ⑦   | 残留死代码 naive_forecast/linear_forecast                                                                                                                            | 🟡 低  |
+| # | 缺陷                                                                                               | 严重度  |
+| - | ------------------------------------------------------------------------------------------------ | ---- |
+| ① | 选型不合规：任务书要求 Prophet/ARIMA/LSTM/XGBoost，ETS 不在其列。这是最大风险，不是精度问题而是"用错了模型族"                          | 🔴 高 |
+| ② | 精度差：留出验收 MAPE≈74.86%，被追问准确率会很被动                                                                  | 🔴 高 |
+| ③ | 收敛告警：Optimization failed to converge，optimizer 没收敛，演示日志里会暴露                                      | 🟠 中 |
+| ④ | 置信区间是"伪区间"：用残差 std×1.96 的对称经验带 + max(yhat0.05)兜底，不是模型自身的预测区间；而且区间宽度不随预测步长变宽（多步预测不确定性本应递增），答辩易被问破 | 🟠 中 |
+| ⑤ | 回测是样本内：MAE/MAPE 用 fittedvalues 自比，不是样本外留出法，高估了真实泛化（即便如此数值仍差）                                     | 🟠 中 |
+| ⑥ | 无季节性建模（seasonal=None），周度波动未捕捉（不过 91 周难做 52 周季节性，这条可接受）                                           | 🟡 低 |
+| ⑦ | 残留死代码 naive\_forecast/linear\_forecast                                                           | 🟡 低 |
 
-一句话：核心病根是 ①（合规）+②（精度）+④（伪区间）。B5 的 ARIMA 方案正好对症——换成允许列表内的模型、用 get_forecast().conf_int() 出真区间（且随步长变宽）、用留出法回测给真实 MAPE，三个主要缺陷一次性解决。
+一句话：核心病根是 ①（合规）+②（精度）+④（伪区间）。B5 的 ARIMA 方案正好对症——换成允许列表内的模型、用 get\_forecast().conf\_int() 出真区间（且随步长变宽）、用留出法回测给真实 MAPE，三个主要缺陷一次性解决。
 **目标**
 
 1. 合规：改用 **ARIMA**（statsmodels 自带，风险最低；ARIMA 在任务书允许列表内）。
@@ -89,7 +89,7 @@
   - `forecast`：每项含 `week_start`、`model`、`yhat`、`yhat_lower`、`yhat_upper`；
   - `diagnostics`：含 `model`、`point_count`、`backtest_window`、`mae`、`mape`、`warnings`。
 - **保留** `naive_forecast`、`linear_forecast` 两个旧函数（仍被单测引用，勿删）。
-- 把残留的 `"ETS"` 字样改为 `"ARIMA"`：`agents/orchestrator.py` 第 ~328 行兜底 diagnostics、第 ~189 行 agent 描述，以及 `tests/test_skeleton.py` 里 `forecast_diagnostics={"model": "ETS"}` 的测试夹具（共 3 处，纯字符串，改了更一致）。
+- 把残留的 `"ETS"` 字样改为 `"ARIMA"`：`agents/orchestrator.py` 第 \~328 行兜底 diagnostics、第 \~189 行 agent 描述，以及 `tests/test_skeleton.py` 里 `forecast_diagnostics={"model": "ETS"}` 的测试夹具（共 3 处，纯字符串，改了更一致）。
 
 **操作步骤**
 
@@ -242,7 +242,8 @@ GROUP BY c.customer_state ORDER BY late_orders DESC;
 输出建议格式：
 
 | 查询问题   | 基础表耗时 | 预聚合表耗时 | 加速效果 |
-| ---------- | ---------- | ------------ | -------- |
-| 月度 GMV   | xx ms      | xx ms        | x.x×     |
-| 州销售排行 | xx ms      | xx ms        | x.x×     |
-| 配送延迟   | xx ms      | xx ms        | x.x×     |
+| ------ | ----- | ------ | ---- |
+| 月度 GMV | xx ms | xx ms  | x.x× |
+| 州销售排行  | xx ms | xx ms  | x.x× |
+| 配送延迟   | xx ms | xx ms  | x.x× |
+

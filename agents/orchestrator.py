@@ -189,7 +189,7 @@ def _steps_for_agents(required_agents: tuple[str, ...], analysis_type: str) -> t
     labels = {
         "orchestrator": "Orchestrator: use LLM structured planning to parse intent and choose agent path",
         "data_analyst": "DataAnalyst: generate view-first SQL from the planner output and summarize evidence",
-        "forecast_model": "ForecastModel: build ETS forecast and expose diagnostics when a future series is required",
+        "forecast_model": "ForecastModel: build ARIMA forecast and expose diagnostics when a future series is required",
         "whatif_model": "WhatIf: 反事实模拟，排除指定群体后在真实数据上重算平台指标并对比干预前后",
         "visualizer": "Visualizer: render charts from planner chart requirements and query result shape",
         "decision_maker": "DecisionMaker: generate data-grounded recommendations with the real LLM",
@@ -318,6 +318,25 @@ def _refine_plan_node(state: WorkflowState) -> WorkflowState:
 
 def _forecast_node(state: WorkflowState) -> WorkflowState:
     data_analysis = state["data_analysis"]
+
+    def forecast_summary(forecast: list[dict[str, float | str]], diagnostics: dict[str, object]) -> str:
+        if not forecast:
+            return ""
+        first = forecast[0]
+        last = forecast[-1]
+        first_yhat = float(first.get("yhat", 0.0))
+        last_yhat = float(last.get("yhat", 0.0))
+        trend = "上升" if last_yhat > first_yhat else "下行" if last_yhat < first_yhat else "基本持平"
+        mape = diagnostics.get("mape")
+        mape_text = f"，留出法 MAPE 约 {float(mape) * 100:.2f}%" if isinstance(mape, (int, float)) else ""
+        dropped = diagnostics.get("dropped_tail_points") or 0
+        dropped_text = f"，建模时剔除 {dropped} 个尾部不完整周" if dropped else ""
+        return (
+            f"ARIMA 预测未来 6 周 GMV 将从 {first_yhat:,.2f} 变化至 {last_yhat:,.2f}，整体趋势{trend}；"
+            f"最后一期 95% 预测区间约为 {float(last.get('yhat_lower', 0.0)):,.2f} 到 {float(last.get('yhat_upper', 0.0)):,.2f}"
+            f"{mape_text}{dropped_text}。"
+        )
+
     def forecast_score(task_name: str, result: Any) -> int:
         if not {"week_start", "total_gmv"}.issubset(result.columns):
             return -1
@@ -335,9 +354,17 @@ def _forecast_node(state: WorkflowState) -> WorkflowState:
     if weekly_candidates and max(score for score, _result in weekly_candidates) < 0:
         weekly_result = None
     if not weekly_result:
-        return {"forecast": [], "forecast_diagnostics": {"model": "ETS", "point_count": 0, "warnings": ["未命中周度 GMV 序列"]}}
+        return {"forecast": [], "forecast_diagnostics": {"model": "ARIMA", "point_count": 0, "warnings": ["未命中周度 GMV 序列"]}}
     forecast, diagnostics = forecast_sales_6_weeks_with_diagnostics(weekly_result.rows)
-    return {"forecast": forecast, "forecast_diagnostics": diagnostics}
+    summary = forecast_summary(forecast, diagnostics)
+    if not summary:
+        return {"forecast": forecast, "forecast_diagnostics": diagnostics}
+    updated_analysis = replace(
+        data_analysis,
+        summary=f"{data_analysis.summary}\n{summary}",
+        direct_answer=summary,
+    )
+    return {"forecast": forecast, "forecast_diagnostics": diagnostics, "data_analysis": updated_analysis}
 
 
 def _visualizer_node(state: WorkflowState) -> WorkflowState:

@@ -677,7 +677,7 @@ def test_general_validation_contract_uses_workflow_outputs(monkeypatch):
         charts=[{"id": "c1", "title": "chart", "type": "plotly_bar", "source_view": "mv_state_sales", "html": "<div>chart</div>", "summary": "summary"}],
         recommendations=[],
         forecast=[{"week_start": "2018-09-01", "yhat": 1.0, "yhat_lower": 0.8, "yhat_upper": 1.2}],
-        forecast_diagnostics={"model": "ETS"},
+        forecast_diagnostics={"model": "ARIMA"},
     )
     monkeypatch.setattr(cli_module, "run_workflow", lambda question, generate_recommendations=False: workflow)
     report = cli_module.run_general_validation()
