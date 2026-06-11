@@ -4,6 +4,12 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Agentic BI - Olist 运营分析系统</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Newsreader:opsz,wght@6..72,400;6..72,500;6..72,600&display=swap"
+      rel="stylesheet"
+    />
     <link rel="stylesheet" href="/static/styles.css" />
   </head>
   <body>
@@ -20,6 +26,18 @@
     </header>
 
     <main class="layout">
+      <aside class="panel sidebar" aria-label="会话列表">
+        <div class="sidebar-head">
+          <h2>会话</h2>
+          <button id="new-conversation" class="ghost compact icon-btn" type="button" title="新建对话">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+            <span>新建</span>
+          </button>
+        </div>
+        <nav id="conversation-list" class="conversation-list" aria-label="历史会话"></nav>
+        <p class="sidebar-hint muted">会话记忆保存在后端，刷新后可继续；删除将清空该会话记忆。</p>
+      </aside>
+
       <section class="panel chat-panel" aria-label="对话区">
         <div class="panel-heading">
           <h2>对话区</h2>
@@ -40,7 +58,10 @@
       <section class="panel result-panel" aria-label="分析结果">
         <div class="panel-heading">
           <h2>分析结果</h2>
-          <span id="stage-label" class="state-pill idle">等待问题</span>
+          <div class="heading-actions">
+            <button id="download-json" class="ghost compact" type="button" disabled title="下载本次分析的原始事件流 JSON">下载事件JSON</button>
+            <span id="stage-label" class="state-pill idle">等待问题</span>
+          </div>
         </div>
         <div class="tabs" role="tablist">
           <button class="tab active" data-target="overview" type="button">总览</button>
@@ -48,10 +69,10 @@
           <button class="tab" data-target="sql" type="button">SQL</button>
           <button class="tab" data-target="agent" type="button">Agent</button>
           <button class="tab" data-target="advice" type="button">建议</button>
-          <button class="tab" data-target="raw" type="button">JSON</button>
         </div>
 
         <section id="overview" class="tab-panel active">
+          <div id="pipeline" class="pipeline" aria-label="分析处理流程"></div>
           <div id="kpis" class="kpi-grid"></div>
           <div class="surface">
             <h3>结论摘要</h3>
@@ -93,12 +114,8 @@
           <div id="whatif-block" class="surface whatif-block"></div>
           <div id="forecast-json" class="surface forecast-block"></div>
         </section>
-
-        <section id="raw" class="tab-panel">
-          <pre id="raw-output">[]</pre>
-        </section>
       </section>
     </main>
-    <script src="/static/app.js?v=final-sprint-20260605-watchdog"></script>
+    <script src="/static/app.js?v=final-sprint-20260611-answermeta"></script>
   </body>
 </html>

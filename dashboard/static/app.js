@@ -22,8 +22,94 @@ const panels = {
   advice: document.querySelector("#advice-stream"),
   whatif: document.querySelector("#whatif-block"),
   forecast: document.querySelector("#forecast-json"),
-  raw: document.querySelector("#raw-output"),
 };
+
+const downloadJsonButton = document.querySelector("#download-json");
+const pipelineEl = document.querySelector("#pipeline");
+
+// 最近一次分析的原始事件流，供"下载事件JSON"按钮使用（不再实时渲染巨型 JSON，避免切标签卡顿）。
+let latestEvents = [];
+
+// 纯色描边图标（继承 currentColor，无 emoji）。
+const SVG = {
+  orchestrator:
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><polygon points="16 8 14 14 8 16 10 10"/></svg>',
+  data_analyst:
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.5" y2="16.5"/></svg>',
+  forecast_model:
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 17 9 11 13 15 21 7"/><polyline points="15 7 21 7 21 13"/></svg>',
+  visualizer:
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><line x1="6" y1="20" x2="6" y2="12"/><line x1="12" y1="20" x2="12" y2="5"/><line x1="18" y1="20" x2="18" y2="14"/></svg>',
+  whatif_model:
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3h6"/><path d="M10 3v6l-5 8.5A2 2 0 0 0 6.7 21h10.6a2 2 0 0 0 1.7-3.5L14 9V3"/><line x1="7.5" y1="15" x2="16.5" y2="15"/></svg>',
+  decision_maker:
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M9.5 18h5"/><path d="M10 22h4"/><path d="M12 2a7 7 0 0 0-4 12.7c.6.5 1 1.3 1 2.1V18h6v-1.2c0-.8.4-1.6 1-2.1A7 7 0 0 0 12 2z"/></svg>',
+  check:
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>',
+  close:
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><line x1="6" y1="6" x2="18" y2="18"/><line x1="18" y1="6" x2="6" y2="18"/></svg>',
+};
+
+// 总览页流水线步进器：节点 key 与后端 agent 事件一一对应。
+const PIPELINE = [
+  { key: "orchestrator", label: "协调器" },
+  { key: "data_analyst", label: "数据分析" },
+  { key: "forecast_model", label: "预测" },
+  { key: "visualizer", label: "可视化" },
+  { key: "whatif_model", label: "反事实" },
+  { key: "decision_maker", label: "决策" },
+];
+
+function buildPipeline() {
+  const parts = [];
+  PIPELINE.forEach((step, index) => {
+    if (index > 0) parts.push(`<div class="pipeline-connector" data-index="${index}"></div>`);
+    parts.push(
+      `<div class="pipeline-node pending" data-key="${step.key}"><div class="pipeline-dot">${SVG[step.key]}</div><span class="pipeline-label">${step.label}</span></div>`,
+    );
+  });
+  pipelineEl.innerHTML = parts.join("");
+}
+
+function resetPipeline() {
+  pipelineEl.querySelectorAll(".pipeline-node").forEach((node) => {
+    node.className = "pipeline-node pending";
+    const dot = node.querySelector(".pipeline-dot");
+    if (dot) dot.innerHTML = SVG[node.dataset.key] || "";
+  });
+  pipelineEl.querySelectorAll(".pipeline-connector").forEach((connector) => {
+    connector.className = "pipeline-connector";
+  });
+}
+
+function setPipelineNode(key, status) {
+  const mapped = key === "orchestrator_refine" ? "orchestrator" : key;
+  const node = pipelineEl.querySelector(`.pipeline-node[data-key="${mapped}"]`);
+  if (!node) return;
+  node.classList.remove("pending", "active", "done", "error", "skipped");
+  node.classList.add(status);
+  const dot = node.querySelector(".pipeline-dot");
+  if (dot) dot.innerHTML = status === "done" ? SVG.check : SVG[mapped] || "";
+  const index = PIPELINE.findIndex((step) => step.key === mapped);
+  if (index > 0 && (status === "active" || status === "done")) {
+    const connector = pipelineEl.querySelector(`.pipeline-connector[data-index="${index}"]`);
+    if (connector) connector.classList.add("filled");
+  }
+}
+
+function markPipelineError() {
+  pipelineEl.querySelectorAll(".pipeline-node.active").forEach((node) => {
+    node.classList.remove("active");
+    node.classList.add("error");
+  });
+}
+
+function finalizePipeline() {
+  pipelineEl.querySelectorAll(".pipeline-node").forEach((node) => {
+    if (node.classList.contains("active")) setPipelineNode(node.dataset.key, "done");
+    else if (node.classList.contains("pending")) node.classList.replace("pending", "skipped");
+  });
+}
 
 // 各 Agent 启动时的进度文案：让"等待大模型"阶段显式"在动"，而不是停在静态提示上像卡死。
 const AGENT_PROGRESS = {
@@ -101,10 +187,11 @@ function resetResult(text = "正在建立 WebSocket 流式分析，请稍候..."
   panels.advice.textContent = "等待真实大模型流式输出...";
   panels.whatif.innerHTML = "";
   panels.forecast.innerHTML = "";
-  panels.raw.textContent = "[]";
+  resetPipeline();
   activeChart = null;
   downloadChartButton.disabled = true;
   downloadImageButton.disabled = true;
+  downloadJsonButton.disabled = true;
   setStage("分析中", "running");
   activateTab("overview");
 }
@@ -409,10 +496,11 @@ function startStreamingAnalysis(question, options = {}) {
     finished: false,
     failed: false,
   };
-  let rawRenderTimer = null;
   let watchdogTimer = null;
   let slowTicks = 0;
   const WATCHDOG_MS = 45000;
+  // 让"下载事件JSON"始终指向本次运行的事件流（数组原地追加，引用保持有效）。
+  latestEvents = state.events;
 
   function clearWatchdog() {
     if (watchdogTimer) {
@@ -459,18 +547,6 @@ function startStreamingAnalysis(question, options = {}) {
   const socket = new WebSocket(wsUrl("/ws/analyze"));
   activeSocket = socket;
 
-  function scheduleRawRender(force = false) {
-    if (force) {
-      panels.raw.textContent = JSON.stringify(state.events, null, 2);
-      return;
-    }
-    if (rawRenderTimer) return;
-    rawRenderTimer = window.setTimeout(() => {
-      panels.raw.textContent = JSON.stringify(state.events, null, 2);
-      rawRenderTimer = null;
-    }, 250);
-  }
-
   socket.addEventListener("open", () => {
     setPill(connectionState, "流式连接", "running");
     socket.send(JSON.stringify({
@@ -485,7 +561,10 @@ function startStreamingAnalysis(question, options = {}) {
   socket.addEventListener("message", (message) => {
     const event = JSON.parse(message.data);
     state.events.push(event);
-    scheduleRawRender(event.event !== "llm_delta");
+    if (event.event !== "llm_delta") downloadJsonButton.disabled = false;
+    if (event.event === "agent_start") setPipelineNode(event.agent, "active");
+    else if (event.event === "agent_done") setPipelineNode(event.agent, "done");
+    else if (event.event === "data_error" || event.event === "llm_error" || event.event === "sql_error") markPipelineError();
     renderAgentEvent(event);
     armWatchdog();
 
@@ -562,6 +641,7 @@ function startStreamingAnalysis(question, options = {}) {
       const label = event.event === "data_error" ? "数据错误" : event.event === "llm_error" ? "大模型错误" : "SQL规划/执行错误";
       setError(`${label}：${event.error}`);
       appendMessage(`${label}：${event.error}`, "assistant", retryControls());
+      refreshConversations();
       return;
     }
 
@@ -575,13 +655,18 @@ function startStreamingAnalysis(question, options = {}) {
         renderWhatif(event.whatif);
       }
       renderForecast(state.forecast, state.forecastDiagnostics);
-      scheduleRawRender(true);
+      finalizePipeline();
+      downloadJsonButton.disabled = false;
       setStage("完成", "done");
       setPill(connectionState, "就绪", "idle");
+      stripPriorMeta();
+      const answerText = state.directAnswer || state.summary || `已完成 ${state.analysisType || "BI"} 分析。`;
       appendMessage(
-        `已完成 ${state.analysisType || "BI"} 分析，命中：${state.matchedViews.join(", ") || "基础表"}，查询耗时 ${state.elapsedMs || "-"}ms。`,
+        answerText,
         "assistant",
+        buildMetaNode({ analysisType: state.analysisType, matchedViews: state.matchedViews, elapsedMs: state.elapsedMs }),
       );
+      refreshConversations();
     }
   });
 
@@ -603,6 +688,180 @@ function startStreamingAnalysis(question, options = {}) {
   });
 }
 
+// ---------- 会话边栏：多对话新建/切换/删除 + 刷新后从后端回灌对话记录 ----------
+const conversationList = document.querySelector("#conversation-list");
+const newConversationButton = document.querySelector("#new-conversation");
+const PLACEHOLDER_TEXT =
+  "请输入一个 Olist 运营问题，例如：2017年各月GMV趋势？哪些州配送延迟严重？预测未来6期GMV。";
+
+function renderPlaceholder() {
+  messages.innerHTML = "";
+  const node = document.createElement("article");
+  node.className = "message assistant";
+  node.textContent = PLACEHOLDER_TEXT;
+  messages.appendChild(node);
+}
+
+function setMemoryCount(turns) {
+  memoryCount.textContent = `记忆 ${turns} 轮`;
+}
+
+// 回答下方的数据元信息（命中表/类型/耗时），以药丸样式与正文区分；仅挂在最新一条回答上。
+function buildMetaNode({ analysisType, matchedViews, elapsedMs }) {
+  const items = [];
+  if (analysisType) items.push(`类型 ${analysisType}`);
+  items.push(`命中 ${matchedViews && matchedViews.length ? matchedViews.join("、") : "基础表"}`);
+  if (elapsedMs !== "" && elapsedMs != null) items.push(`耗时 ${elapsedMs}ms`);
+  const node = document.createElement("div");
+  node.className = "message-meta";
+  node.innerHTML = items.map((text) => `<span class="meta-chip">${escapeHtml(text)}</span>`).join("");
+  return node;
+}
+
+// 新回答到来前，移除上一条回答的元信息 chip，保证"仅最新一条带数据"。
+function stripPriorMeta() {
+  messages.querySelectorAll(".message-meta").forEach((node) => node.remove());
+}
+
+function renderTranscript(turns) {
+  messages.innerHTML = "";
+  if (!turns || !turns.length) {
+    renderPlaceholder();
+    return;
+  }
+  let lastAnswerIndex = -1;
+  turns.forEach((turn, index) => {
+    if (!turn.failed && (turn.answer || turn.summary)) lastAnswerIndex = index;
+  });
+  turns.forEach((turn, index) => {
+    if (turn.question) appendMessage(turn.question, "user");
+    if (turn.failed) {
+      appendMessage(`该问题上次执行失败：${turn.error || "未知错误"}`, "assistant");
+    } else if (turn.answer || turn.summary) {
+      const meta =
+        index === lastAnswerIndex
+          ? buildMetaNode({ analysisType: turn.analysis_type, matchedViews: turn.matched_views, elapsedMs: turn.elapsed_ms })
+          : null;
+      appendMessage(turn.answer || turn.summary, "assistant", meta);
+    }
+  });
+}
+
+function resetIdleResult() {
+  panels.kpis.innerHTML = renderKpis({});
+  panels.directAnswer.textContent = "等待分析请求...";
+  panels.summary.textContent = "真实 SQL 查询完成后会展示数据摘要。";
+  panels.chartList.innerHTML = "";
+  panels.chartStage.textContent = "等待分析请求...";
+  panels.chartTitle.textContent = "图表工作区";
+  panels.chartSource.textContent = "等待可视化 Agent 输出。";
+  panels.sql.textContent = "等待 SQL 规划...";
+  panels.agent.innerHTML = "";
+  panels.advice.textContent = "等待真实大模型流式输出...";
+  panels.whatif.innerHTML = "";
+  panels.forecast.innerHTML = "";
+  resetPipeline();
+  activeChart = null;
+  latestEvents = [];
+  downloadChartButton.disabled = true;
+  downloadImageButton.disabled = true;
+  downloadJsonButton.disabled = true;
+  setStage("等待问题", "idle");
+  activateTab("overview");
+}
+
+function renderConversationList(sessions) {
+  const list = Array.isArray(sessions) ? sessions : [];
+  const hasActive = list.some((item) => item.session_id === sessionId);
+  // 当前会话若还没有任何落库轮次（刚新建），用占位草稿置顶展示。
+  const items = hasActive ? list : [{ session_id: sessionId, title: "新对话", turn_count: 0 }, ...list];
+  if (!items.length) {
+    conversationList.innerHTML = `<p class="conversation-empty">暂无会话，发送问题即可开始。</p>`;
+    return;
+  }
+  conversationList.innerHTML = "";
+  items.forEach((item) => {
+    const node = document.createElement("div");
+    node.className = `conversation-item${item.session_id === sessionId ? " active" : ""}`;
+    node.innerHTML = `<div class="conv-main"><span class="conv-title">${escapeHtml(item.title || "新对话")}</span><span class="conv-meta">${item.turn_count || 0} 轮 · ${escapeHtml(shortSession(item.session_id))}</span></div><button class="conv-delete" type="button" title="删除会话" aria-label="删除会话">${SVG.close}</button>`;
+    node.querySelector(".conv-main").addEventListener("click", () => switchConversation(item.session_id));
+    node.querySelector(".conv-delete").addEventListener("click", (event) => {
+      event.stopPropagation();
+      deleteConversation(item.session_id);
+    });
+    conversationList.appendChild(node);
+  });
+}
+
+async function fetchSessions() {
+  try {
+    const response = await fetch("/api/sessions");
+    if (response.ok) return (await response.json()).sessions || [];
+  } catch (error) {
+    /* 后端不可用时静默降级，仅展示当前草稿会话 */
+  }
+  return [];
+}
+
+async function refreshConversations() {
+  renderConversationList(await fetchSessions());
+}
+
+async function loadActiveTranscript() {
+  let turns = [];
+  try {
+    const response = await fetch(`/api/sessions/${sessionId}`);
+    if (response.ok) turns = (await response.json()).turns || [];
+  } catch (error) {
+    /* ignore */
+  }
+  renderTranscript(turns);
+  setMemoryCount(turns.length);
+  resetIdleResult();
+}
+
+async function switchConversation(id) {
+  if (id === sessionId) return;
+  if (activeSocket && activeSocket.readyState === WebSocket.OPEN) activeSocket.close();
+  sessionId = id;
+  localStorage.setItem("olistAgenticBiSession", sessionId);
+  sessionLabel.textContent = shortSession(sessionId);
+  await loadActiveTranscript();
+  await refreshConversations();
+}
+
+function newConversation() {
+  if (activeSocket && activeSocket.readyState === WebSocket.OPEN) activeSocket.close();
+  sessionId = crypto.randomUUID();
+  localStorage.setItem("olistAgenticBiSession", sessionId);
+  sessionLabel.textContent = shortSession(sessionId);
+  renderPlaceholder();
+  setMemoryCount(0);
+  resetIdleResult();
+  refreshConversations();
+  input.focus();
+}
+
+async function deleteConversation(id) {
+  try {
+    await fetch(`/api/sessions/${id}`, { method: "DELETE" });
+  } catch (error) {
+    /* ignore */
+  }
+  if (id === sessionId) {
+    const remaining = (await fetchSessions()).filter((item) => item.session_id !== id);
+    if (remaining.length) {
+      await switchConversation(remaining[0].session_id);
+      return;
+    }
+    newConversation();
+    return;
+  }
+  refreshConversations();
+}
+
+newConversationButton.addEventListener("click", newConversation);
+
 form.addEventListener("submit", (event) => {
   event.preventDefault();
   const question = input.value.trim();
@@ -618,7 +877,6 @@ bootstrapButton.addEventListener("click", async () => {
   resetResult("正在初始化/刷新本地真实数据...");
   const response = await fetch("/api/bootstrap?force=true", { method: "POST" });
   const data = await response.json();
-  panels.raw.textContent = JSON.stringify(data, null, 2);
   if (!response.ok) {
     const detail = data.detail || `请求失败：${response.status}`;
     setError(detail);
@@ -655,8 +913,23 @@ downloadImageButton.addEventListener("click", () => {
   });
 });
 
+downloadJsonButton.addEventListener("click", () => {
+  if (!latestEvents.length) return;
+  const blob = new Blob([JSON.stringify(latestEvents, null, 2)], { type: "application/json;charset=utf-8" });
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(blob);
+  link.download = `olist-analysis-events-${Date.now()}.json`;
+  link.click();
+  URL.revokeObjectURL(link.href);
+});
+
 document.querySelectorAll(".tab").forEach((button) => {
   button.addEventListener("click", () => activateTab(button.dataset.target));
 });
 
+buildPipeline();
 panels.kpis.innerHTML = renderKpis({});
+
+// 初始化：刷新后从后端回灌当前会话的对话记录，并加载会话列表，保证界面与后端记忆一致。
+loadActiveTranscript();
+refreshConversations();

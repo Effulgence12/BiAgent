@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 import json
+import time
 
 from fastapi import FastAPI, HTTPException, WebSocket
 from fastapi.responses import FileResponse
@@ -26,6 +27,8 @@ app = FastAPI(title="Agentic BI Olist", version="0.3.0")
 app.mount("/static", StaticFiles(directory=DASHBOARD_DIR / "static"), name="static")
 
 SESSIONS: dict[str, list[dict[str, Any]]] = {}
+# 记录每个会话最后更新时间，用于会话列表按最近活跃排序。
+SESSION_UPDATED: dict[str, float] = {}
 
 
 class AnalyzeRequest(BaseModel):
@@ -150,11 +153,14 @@ def _remember(session_id: str, question: str, workflow, matched_views: list[str]
             "direct_answer": workflow.data_analysis.direct_answer,
             "summary": workflow.data_analysis.summary,
             "matched_views": matched_views,
+            "analysis_type": workflow.plan.analysis_type,
+            "elapsed_ms": round(workflow.data_analysis.result.elapsed_ms, 2),
             "sql_tasks": [{"name": task.name, "purpose": task.purpose, "sql": task.sql.strip()} for task in workflow.data_analysis.tasks],
             "planner_plan": workflow.plan.to_context(),
         }
     )
     SESSIONS[session_id] = SESSIONS[session_id][-6:]
+    SESSION_UPDATED[session_id] = time.time()
 
 
 def _remember_failed(session_id: str, question: str, error: str, error_type: str, request_id: str, retry_of: str = "") -> None:
@@ -173,6 +179,68 @@ def _remember_failed(session_id: str, question: str, error: str, error_type: str
         }
     )
     SESSIONS[session_id] = SESSIONS[session_id][-6:]
+    SESSION_UPDATED[session_id] = time.time()
+
+
+def _session_title(history: list[dict[str, Any]]) -> str:
+    """以首个非空提问作为会话标题，截断展示。"""
+    for turn in history:
+        question = str(turn.get("question") or "").strip()
+        if question:
+            return question[:40]
+    return "新对话"
+
+
+def _session_brief(session_id: str) -> dict[str, Any]:
+    history = SESSIONS.get(session_id, [])
+    return {
+        "session_id": session_id,
+        "title": _session_title(history),
+        "turn_count": len(history),
+        "last_question": history[-1].get("question", "") if history else "",
+        "updated_at": SESSION_UPDATED.get(session_id, 0.0),
+    }
+
+
+def _session_transcript(session_id: str) -> list[dict[str, Any]]:
+    """把后端记忆轮次还原成前端可直接渲染的对话转录。"""
+    transcript: list[dict[str, Any]] = []
+    for turn in SESSIONS.get(session_id, []):
+        transcript.append(
+            {
+                "question": turn.get("question", ""),
+                "answer": turn.get("direct_answer", ""),
+                "summary": turn.get("summary", ""),
+                "matched_views": turn.get("matched_views", []),
+                "analysis_type": turn.get("analysis_type", ""),
+                "elapsed_ms": turn.get("elapsed_ms", ""),
+                "failed": bool(turn.get("failed_turn")),
+                "error": turn.get("error", ""),
+            }
+        )
+    return transcript
+
+
+@app.get("/api/sessions")
+def list_sessions() -> dict[str, Any]:
+    """列出所有已有会话，按最近活跃倒序，供前端会话边栏展示。"""
+    briefs = [_session_brief(sid) for sid in SESSIONS]
+    briefs.sort(key=lambda item: item["updated_at"], reverse=True)
+    return {"sessions": briefs}
+
+
+@app.get("/api/sessions/{session_id}")
+def get_session(session_id: str) -> dict[str, Any]:
+    """返回单个会话的完整对话转录，用于刷新/切换时回灌聊天记录。"""
+    return {**_session_brief(session_id), "turns": _session_transcript(session_id)}
+
+
+@app.delete("/api/sessions/{session_id}")
+def delete_session(session_id: str) -> dict[str, Any]:
+    """删除指定会话的全部记忆。"""
+    SESSIONS.pop(session_id, None)
+    SESSION_UPDATED.pop(session_id, None)
+    return {"status": "ok", "session_id": session_id}
 
 
 @app.get("/")
