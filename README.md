@@ -19,13 +19,13 @@
 - `app.py`：FastAPI 入口，包含健康检查、数据初始化、同步分析接口与 WebSocket 流式接口。
 - `agents/`：LangGraph 编排的 Orchestrator、DataAnalyst、ForecastModel、Visualizer、DecisionMaker 可运行实现。
 - `utils/`：真实 CSV 校验、MySQL/SQLite 分析库、数据清洗导入、数据字典与 SQL 路由判断。
-- `sql/`：MySQL 基础表结构与 10 张预聚合表刷新 SQL。
+- `sql/`：MySQL 基础表结构与 10 张预聚合表刷新 SQL（另有 1 张 Python 侧主题表 `mv_review_topics`，共 11 张预聚合表）。
 - `dashboard/`：原生 HTML/CSS/JS 双栏交互页面。
 - `docs/`：骨架说明、API Key 说明、运行与验收手册。
 
 ## 快速启动
 
-使用 linux 终端：
+在类 Unix（Linux/macOS）终端下，使用 venv：
 
 ```bash
 python -m venv .venv
@@ -34,10 +34,12 @@ pip install -r requirements.txt
 uvicorn app:app --reload
 ```
 
-如果使用 conda 管理环境，则使用当前项目环境：
+如果使用 conda 管理环境，推荐新建项目环境：
 
 ```bash
-conda activate bussiness_final
+conda create -n <虚拟环境名> python=3.11
+conda activate <虚拟环境名>
+pip install -r requirements.txt
 uvicorn app:app --reload
 ```
 
@@ -95,7 +97,7 @@ python -m utils.db_init --counts
 python -m utils.perf_compare
 ```
 
-## SQLite 兜底数据准备
+## SQLite 数据准备(备用兜底)
 
 真实 Olist CSV 文件应放入 `data/raw/`。原始 CSV、SQLite 本地库和生成产物已在 `.gitignore` 中排除，避免提交大文件。SQLite 本地库由真实 CSV 重建；MySQL 建表与预聚合刷新 SQL 位于 `sql/schema.sql` 与 `sql/materialized_views.sql`。
 
